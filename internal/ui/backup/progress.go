@@ -1,325 +1,169 @@
 package backup
 
 import (
-	"context"
-	"io"
-	"os"
 	"sync"
 	"time"
 
 	"github.com/restic/restic/internal/archiver"
 	"github.com/restic/restic/internal/restic"
-	"github.com/restic/restic/internal/ui/signals"
+	"github.com/restic/restic/internal/ui/progress"
 )
 
+// A ProgressPrinter can print various progress messages.
+// It must be safe to call its methods from concurrent goroutines.
 type ProgressPrinter interface {
 	Update(total, processed Counter, errors uint, currentFiles map[string]struct{}, start time.Time, secs uint64)
-	Error(item string, fi os.FileInfo, err error) error
-	ScannerError(item string, fi os.FileInfo, err error) error
-	CompleteItem(messageType string, item string, previous, current *restic.Node, s archiver.ItemStats, d time.Duration)
-	ReportTotal(item string, start time.Time, s archiver.ScanStats)
-	Finish(snapshotID restic.ID, start time.Time, summary *Summary, dryRun bool)
+	Error(item string, err error) error
+	ScannerError(item string, err error) error
+	CompleteItem(messageType string, item string, s archiver.ItemStats, d time.Duration)
+	ReportTotal(start time.Time, s archiver.ScanStats)
+	Finish(snapshotID restic.ID, summary *archiver.Summary, dryRun bool)
 	Reset()
+	ExcludedItem(path string)
 
-	// ui.StdioWrapper
-	Stdout() io.WriteCloser
-	Stderr() io.WriteCloser
-
-	E(msg string, args ...interface{})
-	P(msg string, args ...interface{})
-	V(msg string, args ...interface{})
-	VV(msg string, args ...interface{})
+	restic.Printer
 }
 
 type Counter struct {
 	Files, Dirs, Bytes uint64
 }
 
-type fileWorkerMessage struct {
-	filename string
-	done     bool
-}
-
-type ProgressReporter interface {
-	CompleteItem(item string, previous, current *restic.Node, s archiver.ItemStats, d time.Duration)
-	StartFile(filename string)
-	CompleteBlob(filename string, bytes uint64)
-	ScannerError(item string, fi os.FileInfo, err error) error
-	ReportTotal(item string, s archiver.ScanStats)
-	SetMinUpdatePause(d time.Duration)
-	Run(ctx context.Context) error
-	Error(item string, fi os.FileInfo, err error) error
-	Finish(snapshotID restic.ID)
-}
-
-type Summary struct {
-	sync.Mutex
-	Files, Dirs struct {
-		New       uint
-		Changed   uint
-		Unchanged uint
-	}
-	ProcessedBytes uint64
-	archiver.ItemStats
-}
-
 // Progress reports progress for the `backup` command.
 type Progress struct {
-	MinUpdatePause time.Duration
+	progress.Updater
+	mu sync.Mutex
 
-	start time.Time
-	dry   bool
+	start     time.Time
+	estimator rateEstimator
 
-	totalBytes uint64
+	scanStarted, scanFinished bool
 
-	totalCh     chan Counter
-	processedCh chan Counter
-	errCh       chan struct{}
-	workerCh    chan fileWorkerMessage
-	closed      chan struct{}
+	currentFiles     map[string]struct{}
+	processed, total Counter
+	errors           uint
 
-	summary *Summary
 	printer ProgressPrinter
 }
 
-func NewProgress(printer ProgressPrinter) *Progress {
-	return &Progress{
-		// limit to 60fps by default
-		MinUpdatePause: time.Second / 60,
-		start:          time.Now(),
-
-		totalCh:     make(chan Counter),
-		processedCh: make(chan Counter),
-		errCh:       make(chan struct{}),
-		workerCh:    make(chan fileWorkerMessage),
-		closed:      make(chan struct{}),
-
-		summary: &Summary{},
-
-		printer: printer,
-	}
+func NewProgress(printer ProgressPrinter, quiet, json, canUpdateStatus bool) *Progress {
+	return newProgress(printer, progress.CalculateProgressInterval(!quiet, json, canUpdateStatus))
 }
 
-// Run regularly updates the status lines. It should be called in a separate
-// goroutine.
-func (p *Progress) Run(ctx context.Context) error {
-	var (
-		lastUpdate       time.Time
-		total, processed Counter
-		errors           uint
-		started          bool
-		currentFiles     = make(map[string]struct{})
-		secondsRemaining uint64
-	)
-
-	t := time.NewTicker(time.Second)
-	signalsCh := signals.GetProgressChannel()
-	defer t.Stop()
-	defer close(p.closed)
-	// Reset status when finished
-	defer p.printer.Reset()
-
-	for {
-		forceUpdate := false
-		select {
-		case <-ctx.Done():
-			return nil
-		case t, ok := <-p.totalCh:
-			if ok {
-				total = t
-				started = true
-			} else {
-				// scan has finished
-				p.totalCh = nil
-				p.totalBytes = total.Bytes
-			}
-		case s := <-p.processedCh:
-			processed.Files += s.Files
-			processed.Dirs += s.Dirs
-			processed.Bytes += s.Bytes
-			started = true
-		case <-p.errCh:
-			errors++
-			started = true
-		case m := <-p.workerCh:
-			if m.done {
-				delete(currentFiles, m.filename)
-			} else {
-				currentFiles[m.filename] = struct{}{}
-			}
-		case <-t.C:
-			if !started {
-				continue
-			}
-
-			if p.totalCh == nil {
-				secs := float64(time.Since(p.start) / time.Second)
-				todo := float64(total.Bytes - processed.Bytes)
-				secondsRemaining = uint64(secs / float64(processed.Bytes) * todo)
-			}
-		case <-signalsCh:
-			forceUpdate = true
-		}
-
-		// limit update frequency
-		if !forceUpdate && (time.Since(lastUpdate) < p.MinUpdatePause || p.MinUpdatePause == 0) {
-			continue
-		}
-		lastUpdate = time.Now()
-
-		p.printer.Update(total, processed, errors, currentFiles, p.start, secondsRemaining)
+func newProgress(printer ProgressPrinter, interval time.Duration) *Progress {
+	p := &Progress{
+		start:        time.Now(),
+		currentFiles: make(map[string]struct{}),
+		printer:      printer,
+		estimator:    *newRateEstimator(time.Now()),
 	}
-}
+	p.Updater = *progress.NewUpdater(interval, func(_ time.Duration, final bool) {
+		if final {
+			p.printer.Reset()
+		} else {
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			if !p.scanStarted {
+				return
+			}
 
-// ScannerError is the error callback function for the scanner, it prints the
-// error in verbose mode and returns nil.
-func (p *Progress) ScannerError(item string, fi os.FileInfo, err error) error {
-	return p.printer.ScannerError(item, fi, err)
+			var secondsRemaining uint64
+			if p.scanFinished {
+				rate := p.estimator.rate(time.Now())
+				tooSlowCutoff := 1024.
+				if rate <= tooSlowCutoff {
+					secondsRemaining = 0
+				} else {
+					todo := float64(p.total.Bytes - p.processed.Bytes)
+					secondsRemaining = uint64(todo / rate)
+				}
+			}
+
+			p.printer.Update(p.total, p.processed, p.errors, p.currentFiles, p.start, secondsRemaining)
+		}
+	})
+	return p
 }
 
 // Error is the error callback function for the archiver, it prints the error and returns nil.
-func (p *Progress) Error(item string, fi os.FileInfo, err error) error {
-	cbErr := p.printer.Error(item, fi, err)
+func (p *Progress) Error(item string, err error) error {
+	p.mu.Lock()
+	p.errors++
+	p.scanStarted = true
+	p.mu.Unlock()
 
-	select {
-	case p.errCh <- struct{}{}:
-	case <-p.closed:
-	}
-	return cbErr
+	return p.printer.Error(item, err)
 }
 
 // StartFile is called when a file is being processed by a worker.
 func (p *Progress) StartFile(filename string) {
-	select {
-	case p.workerCh <- fileWorkerMessage{filename: filename}:
-	case <-p.closed:
-	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.currentFiles[filename] = struct{}{}
+}
+
+func (p *Progress) addProcessed(c Counter) {
+	p.processed.Files += c.Files
+	p.processed.Dirs += c.Dirs
+	p.processed.Bytes += c.Bytes
+	p.estimator.recordBytes(time.Now(), c.Bytes)
+	p.scanStarted = true
 }
 
 // CompleteBlob is called for all saved blobs for files.
-func (p *Progress) CompleteBlob(filename string, bytes uint64) {
-	select {
-	case p.processedCh <- Counter{Bytes: bytes}:
-	case <-p.closed:
-	}
+func (p *Progress) CompleteBlob(bytes uint64) {
+	p.mu.Lock()
+	p.addProcessed(Counter{Bytes: bytes})
+	p.mu.Unlock()
 }
 
 // CompleteItem is the status callback function for the archiver when a
 // file/dir has been saved successfully.
-func (p *Progress) CompleteItem(item string, previous, current *restic.Node, s archiver.ItemStats, d time.Duration) {
-	p.summary.Lock()
-	p.summary.ItemStats.Add(s)
-
-	// for the last item "/", current is nil
-	if current != nil {
-		p.summary.ProcessedBytes += current.Size
-	}
-
-	p.summary.Unlock()
-
-	if current == nil {
-		// error occurred, tell the status display to remove the line
-		select {
-		case p.workerCh <- fileWorkerMessage{filename: item, done: true}:
-		case <-p.closed:
-		}
+func (p *Progress) CompleteItem(item string, action archiver.ItemAction, s archiver.ItemStats, d time.Duration) {
+	if action.IsZero() {
+		// file reading completed but not fully saved, tell the status display to remove the line
+		p.mu.Lock()
+		delete(p.currentFiles, item)
+		p.mu.Unlock()
 		return
 	}
 
-	switch current.Type {
-	case "file":
-		select {
-		case p.processedCh <- Counter{Files: 1}:
-		case <-p.closed:
-		}
-		select {
-		case p.workerCh <- fileWorkerMessage{filename: item, done: true}:
-		case <-p.closed:
-		}
-	case "dir":
-		select {
-		case p.processedCh <- Counter{Dirs: 1}:
-		case <-p.closed:
-		}
-	}
+	switch action {
+	case archiver.ActionDirNew, archiver.ActionDirUnchanged, archiver.ActionDirModified:
+		p.mu.Lock()
+		p.addProcessed(Counter{Dirs: 1})
+		p.mu.Unlock()
+		p.printer.CompleteItem(string(action), item, s, d)
 
-	if current.Type == "dir" {
-		if previous == nil {
-			p.printer.CompleteItem("dir new", item, previous, current, s, d)
-			p.summary.Lock()
-			p.summary.Dirs.New++
-			p.summary.Unlock()
-			return
-		}
-
-		if previous.Equals(*current) {
-			p.printer.CompleteItem("dir unchanged", item, previous, current, s, d)
-			p.summary.Lock()
-			p.summary.Dirs.Unchanged++
-			p.summary.Unlock()
-		} else {
-			p.printer.CompleteItem("dir modified", item, previous, current, s, d)
-			p.summary.Lock()
-			p.summary.Dirs.Changed++
-			p.summary.Unlock()
-		}
-
-	} else if current.Type == "file" {
-		select {
-		case p.workerCh <- fileWorkerMessage{done: true, filename: item}:
-		case <-p.closed:
-		}
-
-		if previous == nil {
-			p.printer.CompleteItem("file new", item, previous, current, s, d)
-			p.summary.Lock()
-			p.summary.Files.New++
-			p.summary.Unlock()
-			return
-		}
-
-		if previous.Equals(*current) {
-			p.printer.CompleteItem("file unchanged", item, previous, current, s, d)
-			p.summary.Lock()
-			p.summary.Files.Unchanged++
-			p.summary.Unlock()
-		} else {
-			p.printer.CompleteItem("file modified", item, previous, current, s, d)
-			p.summary.Lock()
-			p.summary.Files.Changed++
-			p.summary.Unlock()
-		}
+	case archiver.ActionFileNew, archiver.ActionFileUnchanged, archiver.ActionFileModified:
+		p.mu.Lock()
+		p.addProcessed(Counter{Files: 1})
+		delete(p.currentFiles, item)
+		p.mu.Unlock()
+		p.printer.CompleteItem(string(action), item, s, d)
 	}
 }
 
 // ReportTotal sets the total stats up to now
 func (p *Progress) ReportTotal(item string, s archiver.ScanStats) {
-	select {
-	case p.totalCh <- Counter{Files: uint64(s.Files), Dirs: uint64(s.Dirs), Bytes: s.Bytes}:
-	case <-p.closed:
-	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.total = Counter{Files: uint64(s.Files), Dirs: uint64(s.Dirs), Bytes: s.Bytes}
+	p.scanStarted = true
 
 	if item == "" {
-		p.printer.ReportTotal(item, p.start, s)
-		close(p.totalCh)
-		return
+		p.scanFinished = true
+		p.printer.ReportTotal(p.start, s)
 	}
 }
 
 // Finish prints the finishing messages.
-func (p *Progress) Finish(snapshotID restic.ID) {
+func (p *Progress) Finish(snapshotID restic.ID, summary *archiver.Summary, dryrun bool) {
 	// wait for the status update goroutine to shut down
-	<-p.closed
-	p.printer.Finish(snapshotID, p.start, p.summary, p.dry)
+	p.Updater.Done()
+	p.printer.Finish(snapshotID, summary, dryrun)
 }
 
-// SetMinUpdatePause sets b.MinUpdatePause. It satisfies the
-// ArchiveProgressReporter interface.
-func (p *Progress) SetMinUpdatePause(d time.Duration) {
-	p.MinUpdatePause = d
-}
-
-// SetDryRun marks the backup as a "dry run".
-func (p *Progress) SetDryRun() {
-	p.dry = true
+func (p *Progress) ExcludedItem(path string) {
+	p.printer.ExcludedItem(path)
 }

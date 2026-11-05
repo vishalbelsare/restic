@@ -3,16 +3,18 @@ package dump
 import (
 	"archive/tar"
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/restic/restic/internal/fs"
+	"github.com/restic/restic/internal/data"
+	rtest "github.com/restic/restic/internal/test"
 )
 
 func TestWriteTar(t *testing.T) {
@@ -80,7 +82,7 @@ func checkTar(t *testing.T, testDir string, srcTar *bytes.Buffer) error {
 				return fmt.Errorf("foldernames must end with separator got %v", hdr.Name)
 			}
 		case tar.TypeSymlink:
-			target, err := fs.Readlink(matchPath)
+			target, err := os.Readlink(matchPath)
 			if err != nil {
 				return err
 			}
@@ -91,7 +93,7 @@ func checkTar(t *testing.T, testDir string, srcTar *bytes.Buffer) error {
 			if match.Size() != hdr.Size {
 				return fmt.Errorf("size does not match got %v want %v", hdr.Size, match.Size())
 			}
-			contentsFile, err := ioutil.ReadFile(matchPath)
+			contentsFile, err := os.ReadFile(matchPath)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -112,4 +114,30 @@ func checkTar(t *testing.T, testDir string, srcTar *bytes.Buffer) error {
 	}
 
 	return nil
+}
+
+// #4307.
+func TestFieldTooLong(t *testing.T) {
+	const maxSpecialFileSize = 1 << 20 // Unexported limit in archive/tar.
+
+	node := data.Node{
+		Name: "file_with_xattr",
+		Path: "/file_with_xattr",
+		Type: data.NodeTypeFile,
+		Mode: 0644,
+		ExtendedAttributes: []data.ExtendedAttribute{
+			{
+				Name:  "user.way_too_large",
+				Value: make([]byte, 2*maxSpecialFileSize),
+			},
+		},
+	}
+
+	d := Dumper{format: "tar"}
+	err := d.dumpNodeTar(context.Background(), &node, tar.NewWriter(io.Discard))
+
+	// We want a tar.ErrFieldTooLong that has the filename.
+	rtest.Assert(t, errors.Is(err, tar.ErrFieldTooLong), "wrong type %T", err)
+	rtest.Assert(t, strings.Contains(err.Error(), node.Path),
+		"no filename in %q", err)
 }

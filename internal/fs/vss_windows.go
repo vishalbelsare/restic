@@ -1,16 +1,18 @@
-// +build windows
+//go:build windows
 
 package fs
 
 import (
 	"fmt"
+	"math"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 
-	ole "github.com/go-ole/go-ole"
+	"github.com/go-ole/go-ole"
 	"github.com/restic/restic/internal/errors"
 	"golang.org/x/sys/windows"
 )
@@ -19,8 +21,11 @@ import (
 type HRESULT uint
 
 // HRESULT constant values necessary for using VSS api.
+//
+//nolint:golint
 const (
 	S_OK                                            HRESULT = 0x00000000
+	S_FALSE                                         HRESULT = 0x00000001
 	E_ACCESSDENIED                                  HRESULT = 0x80070005
 	E_OUTOFMEMORY                                   HRESULT = 0x8007000E
 	E_INVALIDARG                                    HRESULT = 0x80070057
@@ -165,7 +170,12 @@ func (h HRESULT) Str() string {
 	return "UNKNOWN"
 }
 
-// VssError encapsulates errors retruned from calling VSS api.
+// Error implements the error interface
+func (h HRESULT) Error() string {
+	return h.Str()
+}
+
+// VssError encapsulates errors returned from calling VSS api.
 type vssError struct {
 	text    string
 	hresult HRESULT
@@ -189,7 +199,12 @@ func (e *vssError) Error() string {
 	return fmt.Sprintf("VSS error: %s: %s (%#x)", e.text, e.hresult.Str(), e.hresult)
 }
 
-// VssError encapsulates errors retruned from calling VSS api.
+// Unwrap returns the underlying HRESULT error
+func (e *vssError) Unwrap() error {
+	return e.hresult
+}
+
+// vssTextError encapsulates errors returned from calling VSS api.
 type vssTextError struct {
 	text string
 }
@@ -254,6 +269,7 @@ type IVssBackupComponents struct {
 }
 
 // IVssBackupComponentsVTable is the vtable for IVssBackupComponents.
+// nolint:structcheck
 type IVssBackupComponentsVTable struct {
 	ole.IUnknownVtbl
 	getWriterComponentsCount      uintptr
@@ -363,7 +379,7 @@ func (vss *IVssBackupComponents) convertToVSSAsync(
 }
 
 // IsVolumeSupported calls the equivalent VSS api.
-func (vss *IVssBackupComponents) IsVolumeSupported(volumeName string) (bool, error) {
+func (vss *IVssBackupComponents) IsVolumeSupported(providerID *ole.GUID, volumeName string) (bool, error) {
 	volumeNamePointer, err := syscall.UTF16PtrFromString(volumeName)
 	if err != nil {
 		panic(err)
@@ -373,7 +389,7 @@ func (vss *IVssBackupComponents) IsVolumeSupported(volumeName string) (bool, err
 	var result uintptr
 
 	if runtime.GOARCH == "386" {
-		id := (*[4]uintptr)(unsafe.Pointer(ole.IID_NULL))
+		id := (*[4]uintptr)(unsafe.Pointer(providerID))
 
 		result, _, _ = syscall.Syscall9(vss.getVTable().isVolumeSupported, 7,
 			uintptr(unsafe.Pointer(vss)), id[0], id[1], id[2], id[3],
@@ -381,7 +397,7 @@ func (vss *IVssBackupComponents) IsVolumeSupported(volumeName string) (bool, err
 			0)
 	} else {
 		result, _, _ = syscall.Syscall6(vss.getVTable().isVolumeSupported, 4,
-			uintptr(unsafe.Pointer(vss)), uintptr(unsafe.Pointer(ole.IID_NULL)),
+			uintptr(unsafe.Pointer(vss)), uintptr(unsafe.Pointer(providerID)),
 			uintptr(unsafe.Pointer(volumeNamePointer)), uintptr(unsafe.Pointer(&isSupportedRaw)), 0,
 			0)
 	}
@@ -407,24 +423,24 @@ func (vss *IVssBackupComponents) StartSnapshotSet() (ole.GUID, error) {
 }
 
 // AddToSnapshotSet calls the equivalent VSS api.
-func (vss *IVssBackupComponents) AddToSnapshotSet(volumeName string, idSnapshot *ole.GUID) error {
+func (vss *IVssBackupComponents) AddToSnapshotSet(volumeName string, providerID *ole.GUID, idSnapshot *ole.GUID) error {
 	volumeNamePointer, err := syscall.UTF16PtrFromString(volumeName)
 	if err != nil {
 		panic(err)
 	}
 
-	var result uintptr = 0
+	var result uintptr
 
 	if runtime.GOARCH == "386" {
-		id := (*[4]uintptr)(unsafe.Pointer(ole.IID_NULL))
+		id := (*[4]uintptr)(unsafe.Pointer(providerID))
 
 		result, _, _ = syscall.Syscall9(vss.getVTable().addToSnapshotSet, 7,
-			uintptr(unsafe.Pointer(vss)), uintptr(unsafe.Pointer(volumeNamePointer)), id[0], id[1],
-			id[2], id[3], uintptr(unsafe.Pointer(idSnapshot)), 0, 0)
+			uintptr(unsafe.Pointer(vss)), uintptr(unsafe.Pointer(volumeNamePointer)),
+			id[0], id[1], id[2], id[3], uintptr(unsafe.Pointer(idSnapshot)), 0, 0)
 	} else {
 		result, _, _ = syscall.Syscall6(vss.getVTable().addToSnapshotSet, 4,
 			uintptr(unsafe.Pointer(vss)), uintptr(unsafe.Pointer(volumeNamePointer)),
-			uintptr(unsafe.Pointer(ole.IID_NULL)), uintptr(unsafe.Pointer(idSnapshot)), 0, 0)
+			uintptr(unsafe.Pointer(providerID)), uintptr(unsafe.Pointer(idSnapshot)), 0, 0)
 	}
 
 	return newVssErrorIfResultNotOK("AddToSnapshotSet() failed", HRESULT(result))
@@ -477,9 +493,9 @@ func (vss *IVssBackupComponents) DoSnapshotSet() (*IVSSAsync, error) {
 
 // DeleteSnapshots calls the equivalent VSS api.
 func (vss *IVssBackupComponents) DeleteSnapshots(snapshotID ole.GUID) (int32, ole.GUID, error) {
-	var deletedSnapshots int32 = 0
+	var deletedSnapshots int32
 	var nondeletedSnapshotID ole.GUID
-	var result uintptr = 0
+	var result uintptr
 
 	if runtime.GOARCH == "386" {
 		id := (*[4]uintptr)(unsafe.Pointer(&snapshotID))
@@ -502,8 +518,8 @@ func (vss *IVssBackupComponents) DeleteSnapshots(snapshotID ole.GUID) (int32, ol
 
 // GetSnapshotProperties calls the equivalent VSS api.
 func (vss *IVssBackupComponents) GetSnapshotProperties(snapshotID ole.GUID,
-	properties *VssSnapshotProperties) error {
-	var result uintptr = 0
+	properties *vssSnapshotProperties) error {
+	var result uintptr
 
 	if runtime.GOARCH == "386" {
 		id := (*[4]uintptr)(unsafe.Pointer(&snapshotID))
@@ -521,13 +537,13 @@ func (vss *IVssBackupComponents) GetSnapshotProperties(snapshotID ole.GUID,
 }
 
 // vssFreeSnapshotProperties calls the equivalent VSS api.
-func vssFreeSnapshotProperties(properties *VssSnapshotProperties) error {
+func vssFreeSnapshotProperties(properties *vssSnapshotProperties) error {
 	proc, err := findVssProc("VssFreeSnapshotProperties")
 	if err != nil {
 		return err
 	}
-
-	proc.Call(uintptr(unsafe.Pointer(properties)))
+	// this function always succeeds and returns no value
+	_, _, _ = proc.Call(uintptr(unsafe.Pointer(properties)))
 	return nil
 }
 
@@ -541,8 +557,9 @@ func (vss *IVssBackupComponents) BackupComplete() (*IVSSAsync, error) {
 	return vss.convertToVSSAsync(oleIUnknown, err)
 }
 
-// VssSnapshotProperties defines the properties of a VSS snapshot as part of the VSS api.
-type VssSnapshotProperties struct {
+// vssSnapshotProperties defines the properties of a VSS snapshot as part of the VSS api.
+// nolint:structcheck
+type vssSnapshotProperties struct {
 	snapshotID           ole.GUID
 	snapshotSetID        ole.GUID
 	snapshotsCount       uint32
@@ -558,9 +575,27 @@ type VssSnapshotProperties struct {
 	status               uint
 }
 
+// VssProviderProperties defines the properties of a VSS provider as part of the VSS api.
+// nolint:structcheck
+type VssProviderProperties struct {
+	providerID        ole.GUID
+	providerName      *uint16
+	providerType      uint32
+	providerVersion   *uint16
+	providerVersionID ole.GUID
+	classID           ole.GUID
+}
+
+func vssFreeProviderProperties(p *VssProviderProperties) {
+	ole.CoTaskMemFree(uintptr(unsafe.Pointer(p.providerName)))
+	p.providerName = nil
+	ole.CoTaskMemFree(uintptr(unsafe.Pointer(p.providerVersion)))
+	p.providerVersion = nil
+}
+
 // GetSnapshotDeviceObject returns root path to access the snapshot files
 // and folders.
-func (p *VssSnapshotProperties) GetSnapshotDeviceObject() string {
+func (p *vssSnapshotProperties) GetSnapshotDeviceObject() string {
 	return ole.UTF16PtrToString(p.snapshotDeviceObject)
 }
 
@@ -614,10 +649,15 @@ func (vssAsync *IVSSAsync) QueryStatus() (HRESULT, uint32) {
 	return HRESULT(result), state
 }
 
-// WaitUntilAsyncFinished waits until either the async call is finshed or
+// WaitUntilAsyncFinished waits until either the async call is finished or
 // the given timeout is reached.
-func (vssAsync *IVSSAsync) WaitUntilAsyncFinished(millis uint32) error {
-	hresult := vssAsync.Wait(millis)
+func (vssAsync *IVSSAsync) WaitUntilAsyncFinished(timeout time.Duration) error {
+	const maxTimeout = math.MaxInt32 * time.Millisecond
+	if timeout > maxTimeout {
+		timeout = maxTimeout
+	}
+
+	hresult := vssAsync.Wait(uint32(timeout.Milliseconds()))
 	err := newVssErrorIfResultNotOK("Wait() failed", hresult)
 	if err != nil {
 		vssAsync.Cancel()
@@ -650,42 +690,111 @@ func (vssAsync *IVSSAsync) WaitUntilAsyncFinished(millis uint32) error {
 	return nil
 }
 
-// MountPoint wraps all information of a snapshot of a mountpoint on a volume.
-type MountPoint struct {
+// UIID_IVSS_ADMIN defines the GUID of IVSSAdmin.
+var (
+	UIID_IVSS_ADMIN       = ole.NewGUID("{77ED5996-2F63-11d3-8A39-00C04F72D8E3}")
+	CLSID_VSS_COORDINATOR = ole.NewGUID("{E579AB5F-1CC4-44b4-BED9-DE0991FF0623}")
+)
+
+// IVSSAdmin VSS api interface.
+type IVSSAdmin struct {
+	ole.IUnknown
+}
+
+// IVSSAdminVTable is the vtable for IVSSAdmin.
+// nolint:structcheck
+type IVSSAdminVTable struct {
+	ole.IUnknownVtbl
+	registerProvider            uintptr
+	unregisterProvider          uintptr
+	queryProviders              uintptr
+	abortAllSnapshotsInProgress uintptr
+}
+
+// getVTable returns the vtable for IVSSAdmin.
+func (vssAdmin *IVSSAdmin) getVTable() *IVSSAdminVTable {
+	return (*IVSSAdminVTable)(unsafe.Pointer(vssAdmin.RawVTable))
+}
+
+// QueryProviders calls the equivalent VSS api.
+func (vssAdmin *IVSSAdmin) QueryProviders() (*IVssEnumObject, error) {
+	var enum *IVssEnumObject
+
+	result, _, _ := syscall.Syscall(vssAdmin.getVTable().queryProviders, 2,
+		uintptr(unsafe.Pointer(vssAdmin)), uintptr(unsafe.Pointer(&enum)), 0)
+
+	return enum, newVssErrorIfResultNotOK("QueryProviders() failed", HRESULT(result))
+}
+
+// IVssEnumObject VSS api interface.
+type IVssEnumObject struct {
+	ole.IUnknown
+}
+
+// IVssEnumObjectVTable is the vtable for IVssEnumObject.
+// nolint:structcheck
+type IVssEnumObjectVTable struct {
+	ole.IUnknownVtbl
+	next  uintptr
+	skip  uintptr
+	reset uintptr
+	clone uintptr
+}
+
+// getVTable returns the vtable for IVssEnumObject.
+func (vssEnum *IVssEnumObject) getVTable() *IVssEnumObjectVTable {
+	return (*IVssEnumObjectVTable)(unsafe.Pointer(vssEnum.RawVTable))
+}
+
+// Next calls the equivalent VSS api.
+func (vssEnum *IVssEnumObject) Next(count uint, props unsafe.Pointer) (uint, error) {
+	var fetched uint32
+	result, _, _ := syscall.Syscall6(vssEnum.getVTable().next, 4,
+		uintptr(unsafe.Pointer(vssEnum)), uintptr(count), uintptr(props),
+		uintptr(unsafe.Pointer(&fetched)), 0, 0)
+	if HRESULT(result) == S_FALSE {
+		return uint(fetched), nil
+	}
+
+	return uint(fetched), newVssErrorIfResultNotOK("Next() failed", HRESULT(result))
+}
+
+// mountPoint wraps all information of a snapshot of a mountpoint on a volume.
+type mountPoint struct {
 	isSnapshotted        bool
 	snapshotSetID        ole.GUID
-	snapshotProperties   VssSnapshotProperties
+	snapshotProperties   vssSnapshotProperties
 	snapshotDeviceObject string
 }
 
 // IsSnapshotted is true if this mount point was snapshotted successfully.
-func (p *MountPoint) IsSnapshotted() bool {
+func (p *mountPoint) IsSnapshotted() bool {
 	return p.isSnapshotted
 }
 
 // GetSnapshotDeviceObject returns root path to access the snapshot files and folders.
-func (p *MountPoint) GetSnapshotDeviceObject() string {
+func (p *mountPoint) GetSnapshotDeviceObject() string {
 	return p.snapshotDeviceObject
 }
 
-// VssSnapshot wraps windows volume shadow copy api (vss) via a simple
+// vssSnapshot wraps windows volume shadow copy api (vss) via a simple
 // interface to create and delete a vss snapshot.
-type VssSnapshot struct {
+type vssSnapshot struct {
 	iVssBackupComponents *IVssBackupComponents
 	snapshotID           ole.GUID
-	snapshotProperties   VssSnapshotProperties
+	snapshotProperties   vssSnapshotProperties
 	snapshotDeviceObject string
-	mountPointInfo       map[string]MountPoint
-	timeoutInMillis      uint32
+	mountPointInfo       map[string]mountPoint
+	timeout              time.Duration
 }
 
 // GetSnapshotDeviceObject returns root path to access the snapshot files
 // and folders.
-func (p *VssSnapshot) GetSnapshotDeviceObject() string {
+func (p *vssSnapshot) GetSnapshotDeviceObject() string {
 	return p.snapshotDeviceObject
 }
 
-// initializeCOMInterface initialize an instance of the VSS COM api
+// initializeVssCOMInterface initialize an instance of the VSS COM api
 func initializeVssCOMInterface() (*ole.IUnknown, error) {
 	vssInstance, err := loadIVssBackupComponentsConstructor()
 	if err != nil {
@@ -693,7 +802,32 @@ func initializeVssCOMInterface() (*ole.IUnknown, error) {
 	}
 
 	// ensure COM is initialized before use
-	ole.CoInitializeEx(0, ole.COINIT_MULTITHREADED)
+	if err = ole.CoInitializeEx(0, ole.COINIT_MULTITHREADED); err != nil {
+		// CoInitializeEx returns S_FALSE if COM is already initialized
+		if oleErr, ok := err.(*ole.OleError); !ok || HRESULT(oleErr.Code()) != S_FALSE {
+			return nil, err
+		}
+	}
+
+	// initialize COM security for VSS, this can't be called more then once
+
+	// Allowing all processes to perform incoming COM calls is not necessarily a security weakness.
+	// A requester acting as a COM server, like all other COM servers, always retains the option to authorize its clients on every COM method implemented in its process.
+	//
+	// Note that internal COM callbacks implemented by VSS are secured by default.
+	// Reference: https://learn.microsoft.com/en-us/windows/win32/vss/security-considerations-for-requestors#:~:text=Allowing%20all%20processes,secured%20by%20default.
+
+	if err = ole.CoInitializeSecurity(
+		-1,   // Default COM authentication service
+		6,    // RPC_C_AUTHN_LEVEL_PKT_PRIVACY
+		3,    // RPC_C_IMP_LEVEL_IMPERSONATE
+		0x20, // EOAC_STATIC_CLOAKING
+	); err != nil {
+		// TODO warn for expected event logs for VSS IVssWriterCallback failure
+		return nil, newVssError(
+			"Failed to initialize security for VSS request",
+			HRESULT(err.(*ole.OleError).Code()))
+	}
 
 	var oleIUnknown *ole.IUnknown
 	result, _, _ := vssInstance.Call(uintptr(unsafe.Pointer(&oleIUnknown)))
@@ -726,36 +860,58 @@ func HasSufficientPrivilegesForVSS() error {
 	return err
 }
 
-// NewVssSnapshot creates a new vss snapshot. If creating the snapshots doesn't
-// finish within the timeout an error is returned.
-func NewVssSnapshot(
-	volume string, timeoutInSeconds uint, msgError ErrorHandler) (VssSnapshot, error) {
-	is64Bit, err := isRunningOn64BitWindows()
+// getVolumeNameForVolumeMountPoint add trailing backslash to input parameter
+// and calls the equivalent windows api.
+func getVolumeNameForVolumeMountPoint(mountPoint string) (string, error) {
+	if mountPoint != "" && mountPoint[len(mountPoint)-1] != filepath.Separator {
+		mountPoint += string(filepath.Separator)
+	}
 
+	mountPointPointer, err := syscall.UTF16PtrFromString(mountPoint)
 	if err != nil {
-		return VssSnapshot{}, newVssTextError(fmt.Sprintf(
+		return mountPoint, err
+	}
+
+	// A reasonable size for the buffer to accommodate the largest possible
+	// volume GUID path is 50 characters.
+	volumeNameBuffer := make([]uint16, 50)
+	if err := windows.GetVolumeNameForVolumeMountPoint(
+		mountPointPointer, &volumeNameBuffer[0], 50); err != nil {
+		return mountPoint, err
+	}
+
+	return syscall.UTF16ToString(volumeNameBuffer), nil
+}
+
+// newVssSnapshot creates a new vss snapshot. If creating the snapshots doesn't
+// finish within the timeout an error is returned.
+func newVssSnapshot(provider string,
+	volume string, timeout time.Duration, filter volumeFilter, msgError ErrorHandler) (vssSnapshot, error) {
+	is64Bit, err := isRunningOn64BitWindows()
+	if err != nil {
+		return vssSnapshot{}, newVssTextError(fmt.Sprintf(
 			"Failed to detect windows architecture: %s", err.Error()))
 	}
 
 	if (is64Bit && runtime.GOARCH != "amd64") || (!is64Bit && runtime.GOARCH != "386") {
-		return VssSnapshot{}, newVssTextError(fmt.Sprintf("executables compiled for %s can't use "+
+		return vssSnapshot{}, newVssTextError(fmt.Sprintf("executables compiled for %s can't use "+
 			"VSS on other architectures. Please use an executable compiled for your platform.",
 			runtime.GOARCH))
 	}
 
-	timeoutInMillis := uint32(timeoutInSeconds * 1000)
+	deadline := time.Now().Add(timeout)
 
 	oleIUnknown, err := initializeVssCOMInterface()
 	if oleIUnknown != nil {
 		defer oleIUnknown.Release()
 	}
 	if err != nil {
-		return VssSnapshot{}, err
+		return vssSnapshot{}, err
 	}
 
 	comInterface, err := queryInterface(oleIUnknown, UUID_IVSS)
 	if err != nil {
-		return VssSnapshot{}, err
+		return vssSnapshot{}, err
 	}
 
 	/*
@@ -777,110 +933,137 @@ func NewVssSnapshot(
 
 	iVssBackupComponents := (*IVssBackupComponents)(unsafe.Pointer(comInterface))
 
+	providerID, err := getProviderID(provider)
+	if err != nil {
+		iVssBackupComponents.Release()
+		return vssSnapshot{}, err
+	}
+
 	if err := iVssBackupComponents.InitializeForBackup(); err != nil {
 		iVssBackupComponents.Release()
-		return VssSnapshot{}, err
+		return vssSnapshot{}, err
 	}
 
 	if err := iVssBackupComponents.SetContext(VSS_CTX_BACKUP); err != nil {
 		iVssBackupComponents.Release()
-		return VssSnapshot{}, err
+		return vssSnapshot{}, err
 	}
 
 	// see https://techcommunity.microsoft.com/t5/Storage-at-Microsoft/What-is-the-difference-between-VSS-Full-Backup-and-VSS-Copy/ba-p/423575
 
 	if err := iVssBackupComponents.SetBackupState(false, false, VSS_BT_COPY, false); err != nil {
 		iVssBackupComponents.Release()
-		return VssSnapshot{}, err
+		return vssSnapshot{}, err
 	}
 
 	err = callAsyncFunctionAndWait(iVssBackupComponents.GatherWriterMetadata,
-		"GatherWriterMetadata", timeoutInMillis)
+		"GatherWriterMetadata", deadline)
 	if err != nil {
 		iVssBackupComponents.Release()
-		return VssSnapshot{}, err
+		return vssSnapshot{}, err
 	}
 
-	if isSupported, err := iVssBackupComponents.IsVolumeSupported(volume); err != nil {
+	if isSupported, err := iVssBackupComponents.IsVolumeSupported(providerID, volume); err != nil {
 		iVssBackupComponents.Release()
-		return VssSnapshot{}, err
+		return vssSnapshot{}, err
 	} else if !isSupported {
 		iVssBackupComponents.Release()
-		return VssSnapshot{}, newVssTextError(fmt.Sprintf("Snapshots are not supported for volume "+
+		return vssSnapshot{}, newVssTextError(fmt.Sprintf("Snapshots are not supported for volume "+
 			"%s", volume))
 	}
 
-	snapshotSetID, err := iVssBackupComponents.StartSnapshotSet()
-	if err != nil {
-		iVssBackupComponents.Release()
-		return VssSnapshot{}, err
-	}
-
-	if err := iVssBackupComponents.AddToSnapshotSet(volume, &snapshotSetID); err != nil {
-		iVssBackupComponents.Release()
-		return VssSnapshot{}, err
-	}
-
-	mountPoints, err := enumerateMountedFolders(volume)
-	if err != nil {
-		iVssBackupComponents.Release()
-		return VssSnapshot{}, newVssTextError(fmt.Sprintf(
-			"failed to enumerate mount points for volume %s: %s", volume, err))
-	}
-
-	mountPointInfo := make(map[string]MountPoint)
-
-	for _, mountPoint := range mountPoints {
-		// ensure every mountpoint is available even without a valid
-		// snapshot because we need to consider this when backing up files
-		mountPointInfo[mountPoint] = MountPoint{isSnapshotted: false}
-
-		if isSupported, err := iVssBackupComponents.IsVolumeSupported(mountPoint); err != nil {
-			continue
-		} else if !isSupported {
+	const retryStartSnapshotSetSleep = 5 * time.Second
+	var snapshotSetID ole.GUID
+	for {
+		var err error
+		snapshotSetID, err = iVssBackupComponents.StartSnapshotSet()
+		if errors.Is(err, VSS_E_SNAPSHOT_SET_IN_PROGRESS) && time.Now().Add(-retryStartSnapshotSetSleep).Before(deadline) {
+			// retry snapshot set creation while deadline is not reached
+			time.Sleep(retryStartSnapshotSetSleep)
 			continue
 		}
 
-		var mountPointSnapshotSetID ole.GUID
-		err := iVssBackupComponents.AddToSnapshotSet(mountPoint, &mountPointSnapshotSetID)
 		if err != nil {
 			iVssBackupComponents.Release()
-			return VssSnapshot{}, err
+			return vssSnapshot{}, err
+		} else {
+			break
+		}
+	}
+
+	if err := iVssBackupComponents.AddToSnapshotSet(volume, providerID, &snapshotSetID); err != nil {
+		iVssBackupComponents.Release()
+		return vssSnapshot{}, err
+	}
+
+	mountPointInfo := make(map[string]mountPoint)
+
+	// if filter==nil just don't process mount points for this volume at all
+	if filter != nil {
+		mountPoints, err := enumerateMountedFolders(volume)
+		if err != nil {
+			iVssBackupComponents.Release()
+
+			return vssSnapshot{}, newVssTextError(fmt.Sprintf(
+				"failed to enumerate mount points for volume %s: %s", volume, err))
 		}
 
-		mountPointInfo[mountPoint] = MountPoint{isSnapshotted: true,
-			snapshotSetID: mountPointSnapshotSetID}
+		for _, mp := range mountPoints {
+			// ensure every mountpoint is available even without a valid
+			// snapshot because we need to consider this when backing up files
+			mountPointInfo[mp] = mountPoint{isSnapshotted: false}
+
+			if !filter(mp) {
+				continue
+			} else if isSupported, err := iVssBackupComponents.IsVolumeSupported(providerID, mp); err != nil {
+				continue
+			} else if !isSupported {
+				continue
+			}
+
+			var mountPointSnapshotSetID ole.GUID
+			err := iVssBackupComponents.AddToSnapshotSet(mp, providerID, &mountPointSnapshotSetID)
+			if err != nil {
+				iVssBackupComponents.Release()
+
+				return vssSnapshot{}, err
+			}
+
+			mountPointInfo[mp] = mountPoint{
+				isSnapshotted: true,
+				snapshotSetID: mountPointSnapshotSetID,
+			}
+		}
 	}
 
 	err = callAsyncFunctionAndWait(iVssBackupComponents.PrepareForBackup, "PrepareForBackup",
-		timeoutInMillis)
+		deadline)
 	if err != nil {
 		// After calling PrepareForBackup one needs to call AbortBackup() before releasing the VSS
 		// instance for proper cleanup.
-		// It is not neccessary to call BackupComplete before releasing the VSS instance afterwards.
+		// It is not necessary to call BackupComplete before releasing the VSS instance afterwards.
 		iVssBackupComponents.AbortBackup()
 		iVssBackupComponents.Release()
-		return VssSnapshot{}, err
+		return vssSnapshot{}, err
 	}
 
 	err = callAsyncFunctionAndWait(iVssBackupComponents.DoSnapshotSet, "DoSnapshotSet",
-		timeoutInMillis)
+		deadline)
 	if err != nil {
-		iVssBackupComponents.AbortBackup()
+		_ = iVssBackupComponents.AbortBackup()
 		iVssBackupComponents.Release()
-		return VssSnapshot{}, err
+		return vssSnapshot{}, err
 	}
 
-	var snapshotProperties VssSnapshotProperties
+	var snapshotProperties vssSnapshotProperties
 	err = iVssBackupComponents.GetSnapshotProperties(snapshotSetID, &snapshotProperties)
 	if err != nil {
-		iVssBackupComponents.AbortBackup()
+		_ = iVssBackupComponents.AbortBackup()
 		iVssBackupComponents.Release()
-		return VssSnapshot{}, err
+		return vssSnapshot{}, err
 	}
 
 	for mountPoint, info := range mountPointInfo {
-
 		if !info.isSnapshotted {
 			continue
 		}
@@ -899,12 +1082,14 @@ func NewVssSnapshot(
 		mountPointInfo[mountPoint] = info
 	}
 
-	return VssSnapshot{iVssBackupComponents, snapshotSetID, snapshotProperties,
-		snapshotProperties.GetSnapshotDeviceObject(), mountPointInfo, timeoutInMillis}, nil
+	return vssSnapshot{
+		iVssBackupComponents, snapshotSetID, snapshotProperties,
+		snapshotProperties.GetSnapshotDeviceObject(), mountPointInfo, time.Until(deadline),
+	}, nil
 }
 
 // Delete deletes the created snapshot.
-func (p *VssSnapshot) Delete() error {
+func (p *vssSnapshot) Delete() error {
 	var err error
 	if err = vssFreeSnapshotProperties(&p.snapshotProperties); err != nil {
 		return err
@@ -921,15 +1106,17 @@ func (p *VssSnapshot) Delete() error {
 	if p.iVssBackupComponents != nil {
 		defer p.iVssBackupComponents.Release()
 
+		deadline := time.Now().Add(p.timeout)
+
 		err = callAsyncFunctionAndWait(p.iVssBackupComponents.BackupComplete, "BackupComplete",
-			p.timeoutInMillis)
+			deadline)
 		if err != nil {
 			return err
 		}
 
 		if _, _, e := p.iVssBackupComponents.DeleteSnapshots(p.snapshotID); e != nil {
 			err = newVssTextError(fmt.Sprintf("Failed to delete snapshot: %s", e.Error()))
-			p.iVssBackupComponents.AbortBackup()
+			_ = p.iVssBackupComponents.AbortBackup()
 			if err != nil {
 				return err
 			}
@@ -939,12 +1126,61 @@ func (p *VssSnapshot) Delete() error {
 	return nil
 }
 
+func getProviderID(provider string) (*ole.GUID, error) {
+	providerLower := strings.ToLower(provider)
+	switch providerLower {
+	case "":
+		return ole.IID_NULL, nil
+	case "ms":
+		return ole.NewGUID("{b5946137-7b9f-4925-af80-51abd60b20d5}"), nil
+	}
+
+	comInterface, err := ole.CreateInstance(CLSID_VSS_COORDINATOR, UIID_IVSS_ADMIN)
+	if err != nil {
+		return nil, err
+	}
+	defer comInterface.Release()
+
+	vssAdmin := (*IVSSAdmin)(unsafe.Pointer(comInterface))
+
+	enum, err := vssAdmin.QueryProviders()
+	if err != nil {
+		return nil, err
+	}
+	defer enum.Release()
+
+	id := ole.NewGUID(provider)
+
+	var props struct {
+		objectType uint32
+		provider   VssProviderProperties
+	}
+	for {
+		count, err := enum.Next(1, unsafe.Pointer(&props))
+		if err != nil {
+			return nil, err
+		}
+
+		if count < 1 {
+			return nil, errors.Errorf(`invalid VSS provider "%s"`, provider)
+		}
+
+		name := ole.UTF16PtrToString(props.provider.providerName)
+		vssFreeProviderProperties(&props.provider)
+
+		if id != nil && *id == props.provider.providerID ||
+			id == nil && providerLower == strings.ToLower(name) {
+			return &props.provider.providerID, nil
+		}
+	}
+}
+
 // asyncCallFunc is the callback type for callAsyncFunctionAndWait.
 type asyncCallFunc func() (*IVSSAsync, error)
 
 // callAsyncFunctionAndWait calls an async functions and waits for it to either
 // finish or timeout.
-func callAsyncFunctionAndWait(function asyncCallFunc, name string, timeoutInMillis uint32) error {
+func callAsyncFunctionAndWait(function asyncCallFunc, name string, deadline time.Time) error {
 	iVssAsync, err := function()
 	if err != nil {
 		return err
@@ -954,7 +1190,12 @@ func callAsyncFunctionAndWait(function asyncCallFunc, name string, timeoutInMill
 		return newVssTextError(fmt.Sprintf("%s() returned nil", name))
 	}
 
-	err = iVssAsync.WaitUntilAsyncFinished(timeoutInMillis)
+	timeout := time.Until(deadline)
+	if timeout <= 0 {
+		return newVssTextError(fmt.Sprintf("%s() deadline exceeded", name))
+	}
+
+	err = iVssAsync.WaitUntilAsyncFinished(timeout)
 	iVssAsync.Release()
 	return err
 }
@@ -1003,7 +1244,7 @@ func queryInterface(oleIUnknown *ole.IUnknown, guid *ole.GUID) (*interface{}, er
 	return ivss, nil
 }
 
-// isRunningOn64BitWindows returns true if running on 64-bit windows.
+// isRunningOn64BitWindows reports whether the process is running on 64-bit Windows.
 func isRunningOn64BitWindows() (bool, error) {
 	if runtime.GOARCH == "amd64" {
 		return true, nil
@@ -1035,6 +1276,7 @@ func enumerateMountedFolders(volume string) ([]string, error) {
 		return mountedFolders, nil
 	}
 
+	// nolint:errcheck
 	defer windows.FindVolumeMountPointClose(handle)
 
 	volumeMountPoint := syscall.UTF16ToString(volumeMountPointBuffer)

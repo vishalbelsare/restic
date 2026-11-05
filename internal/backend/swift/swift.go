@@ -14,35 +14,36 @@ import (
 	"time"
 
 	"github.com/restic/restic/internal/backend"
+	"github.com/restic/restic/internal/backend/layout"
+	"github.com/restic/restic/internal/backend/location"
+	"github.com/restic/restic/internal/backend/util"
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/errors"
-	"github.com/restic/restic/internal/restic"
+	"github.com/restic/restic/internal/feature"
 
-	"github.com/cenkalti/backoff/v4"
 	"github.com/ncw/swift/v2"
 )
 
 // beSwift is a backend which stores the data on a swift endpoint.
 type beSwift struct {
-	conn      *swift.Connection
-	sem       *backend.Semaphore
-	container string // Container name
-	prefix    string // Prefix of object names in the container
-	backend.Layout
+	conn        *swift.Connection
+	connections uint
+	container   string // Container name
+	prefix      string // Prefix of object names in the container
+	layout.Layout
 }
 
-// ensure statically that *beSwift implements restic.Backend.
-var _ restic.Backend = &beSwift{}
+// ensure statically that *beSwift implements backend.Backend.
+var _ backend.Backend = &beSwift{}
+
+func NewFactory() location.Factory {
+	return location.NewHTTPBackendFactory("swift", ParseConfig, location.NoPassword, Open, Open)
+}
 
 // Open opens the swift backend at a container in region. The container is
 // created if it does not exist yet.
-func Open(ctx context.Context, cfg Config, rt http.RoundTripper) (restic.Backend, error) {
+func Open(ctx context.Context, cfg Config, rt http.RoundTripper, _ func(string, ...any)) (backend.Backend, error) {
 	debug.Log("config %#v", cfg)
-
-	sem, err := backend.NewSemaphore(cfg.Connections)
-	if err != nil {
-		return nil, err
-	}
 
 	be := &beSwift{
 		conn: &swift.Connection{
@@ -50,7 +51,7 @@ func Open(ctx context.Context, cfg Config, rt http.RoundTripper) (restic.Backend
 			UserId:                      cfg.UserID,
 			Domain:                      cfg.Domain,
 			DomainId:                    cfg.DomainID,
-			ApiKey:                      cfg.APIKey,
+			ApiKey:                      cfg.APIKey.Unwrap(),
 			AuthUrl:                     cfg.AuthURL,
 			Region:                      cfg.Region,
 			Tenant:                      cfg.Tenant,
@@ -59,22 +60,19 @@ func Open(ctx context.Context, cfg Config, rt http.RoundTripper) (restic.Backend
 			TenantDomainId:              cfg.TenantDomainID,
 			TrustId:                     cfg.TrustID,
 			StorageUrl:                  cfg.StorageURL,
-			AuthToken:                   cfg.AuthToken,
+			AuthToken:                   cfg.AuthToken.Unwrap(),
 			ApplicationCredentialId:     cfg.ApplicationCredentialID,
 			ApplicationCredentialName:   cfg.ApplicationCredentialName,
-			ApplicationCredentialSecret: cfg.ApplicationCredentialSecret,
+			ApplicationCredentialSecret: cfg.ApplicationCredentialSecret.Unwrap(),
 			ConnectTimeout:              time.Minute,
 			Timeout:                     time.Minute,
 
 			Transport: rt,
 		},
-		sem:       sem,
-		container: cfg.Container,
-		prefix:    cfg.Prefix,
-		Layout: &backend.DefaultLayout{
-			Path: cfg.Prefix,
-			Join: path.Join,
-		},
+		connections: cfg.Connections,
+		container:   cfg.Container,
+		prefix:      cfg.Prefix,
+		Layout:      layout.NewDefaultLayout(cfg.Prefix, path.Join),
 	}
 
 	// Authenticate if needed
@@ -113,9 +111,11 @@ func (be *beSwift) createContainer(ctx context.Context, policy string) error {
 	return be.conn.ContainerCreate(ctx, be.container, h)
 }
 
-// Location returns this backend's location (the container name).
-func (be *beSwift) Location() string {
-	return be.container
+func (be *beSwift) Properties() backend.Properties {
+	return backend.Properties{
+		Connections:      be.connections,
+		HasAtomicReplace: true,
+	}
 }
 
 // Hasher may return a hash function for calculating a content hash for the backend
@@ -125,23 +125,11 @@ func (be *beSwift) Hasher() hash.Hash {
 
 // Load runs fn with a reader that yields the contents of the file at h at the
 // given offset.
-func (be *beSwift) Load(ctx context.Context, h restic.Handle, length int, offset int64, fn func(rd io.Reader) error) error {
-	return backend.DefaultLoad(ctx, h, length, offset, be.openReader, fn)
+func (be *beSwift) Load(ctx context.Context, h backend.Handle, length int, offset int64, fn func(rd io.Reader) error) error {
+	return util.DefaultLoad(ctx, h, length, offset, be.openReader, fn)
 }
 
-func (be *beSwift) openReader(ctx context.Context, h restic.Handle, length int, offset int64) (io.ReadCloser, error) {
-	debug.Log("Load %v, length %v, offset %v", h, length, offset)
-	if err := h.Valid(); err != nil {
-		return nil, backoff.Permanent(err)
-	}
-
-	if offset < 0 {
-		return nil, errors.New("offset is negative")
-	}
-
-	if length < 0 {
-		return nil, errors.Errorf("invalid length %d", length)
-	}
+func (be *beSwift) openReader(ctx context.Context, h backend.Handle, length int, offset int64) (io.ReadCloser, error) {
 
 	objName := be.Filename(h)
 
@@ -154,109 +142,68 @@ func (be *beSwift) openReader(ctx context.Context, h restic.Handle, length int, 
 		headers["Range"] = fmt.Sprintf("bytes=%d-%d", offset, offset+int64(length)-1)
 	}
 
-	if _, ok := headers["Range"]; ok {
-		debug.Log("Load(%v) send range %v", h, headers["Range"])
-	}
-
-	be.sem.GetToken()
 	obj, _, err := be.conn.ObjectOpen(ctx, be.container, objName, false, headers)
 	if err != nil {
-		debug.Log("  err %v", err)
-		be.sem.ReleaseToken()
-		return nil, errors.Wrap(err, "conn.ObjectOpen")
+		return nil, fmt.Errorf("conn.ObjectOpen: %w", err)
 	}
 
-	return be.sem.ReleaseTokenOnClose(obj, nil), nil
+	if feature.Flag.Enabled(feature.BackendErrorRedesign) && length > 0 {
+		// get response length, but don't cause backend calls
+		cctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		objLength, e := obj.Length(cctx)
+		if e == nil && objLength != int64(length) {
+			_ = obj.Close()
+			return nil, &swift.Error{StatusCode: http.StatusRequestedRangeNotSatisfiable, Text: "restic-file-too-short"}
+		}
+	}
+
+	return obj, nil
 }
 
 // Save stores data in the backend at the handle.
-func (be *beSwift) Save(ctx context.Context, h restic.Handle, rd restic.RewindReader) error {
-	if err := h.Valid(); err != nil {
-		return backoff.Permanent(err)
-	}
-
+func (be *beSwift) Save(ctx context.Context, h backend.Handle, rd backend.RewindReader) error {
 	objName := be.Filename(h)
-
-	debug.Log("Save %v at %v", h, objName)
-
-	be.sem.GetToken()
-	defer be.sem.ReleaseToken()
-
 	encoding := "binary/octet-stream"
 
-	debug.Log("PutObject(%v, %v, %v)", be.container, objName, encoding)
 	hdr := swift.Headers{"Content-Length": strconv.FormatInt(rd.Length(), 10)}
 	_, err := be.conn.ObjectPut(ctx,
 		be.container, objName, rd, true, hex.EncodeToString(rd.Hash()),
 		encoding, hdr)
 	// swift does not return the upload length
-	debug.Log("%v, err %#v", objName, err)
 
 	return errors.Wrap(err, "client.PutObject")
 }
 
 // Stat returns information about a blob.
-func (be *beSwift) Stat(ctx context.Context, h restic.Handle) (bi restic.FileInfo, err error) {
-	debug.Log("%v", h)
-
+func (be *beSwift) Stat(ctx context.Context, h backend.Handle) (bi backend.FileInfo, err error) {
 	objName := be.Filename(h)
-
-	be.sem.GetToken()
-	defer be.sem.ReleaseToken()
 
 	obj, _, err := be.conn.Object(ctx, be.container, objName)
 	if err != nil {
-		debug.Log("Object() err %v", err)
-		return restic.FileInfo{}, errors.Wrap(err, "conn.Object")
+		return backend.FileInfo{}, errors.Wrap(err, "conn.Object")
 	}
 
-	return restic.FileInfo{Size: obj.Bytes, Name: h.Name}, nil
-}
-
-// Test returns true if a blob of the given type and name exists in the backend.
-func (be *beSwift) Test(ctx context.Context, h restic.Handle) (bool, error) {
-	objName := be.Filename(h)
-
-	be.sem.GetToken()
-	defer be.sem.ReleaseToken()
-
-	switch _, _, err := be.conn.Object(ctx, be.container, objName); err {
-	case nil:
-		return true, nil
-
-	case swift.ObjectNotFound:
-		return false, nil
-
-	default:
-		return false, errors.Wrap(err, "conn.Object")
-	}
+	return backend.FileInfo{Size: obj.Bytes, Name: h.Name}, nil
 }
 
 // Remove removes the blob with the given name and type.
-func (be *beSwift) Remove(ctx context.Context, h restic.Handle) error {
+func (be *beSwift) Remove(ctx context.Context, h backend.Handle) error {
 	objName := be.Filename(h)
 
-	be.sem.GetToken()
-	defer be.sem.ReleaseToken()
-
 	err := be.conn.ObjectDelete(ctx, be.container, objName)
-	debug.Log("Remove(%v) -> err %v", h, err)
 	return errors.Wrap(err, "conn.ObjectDelete")
 }
 
 // List runs fn for each file in the backend which has the type t. When an
 // error occurs (or fn returns an error), List stops and returns it.
-func (be *beSwift) List(ctx context.Context, t restic.FileType, fn func(restic.FileInfo) error) error {
-	debug.Log("listing %v", t)
-
+func (be *beSwift) List(ctx context.Context, t backend.FileType, fn func(backend.FileInfo) error) error {
 	prefix, _ := be.Basedir(t)
 	prefix += "/"
 
 	err := be.conn.ObjectsWalk(ctx, be.container, &swift.ObjectsOpts{Prefix: prefix},
-		func(ctx context.Context, opts *swift.ObjectsOpts) (interface{}, error) {
-			be.sem.GetToken()
+		func(ctx context.Context, opts *swift.ObjectsOpts) (any, error) {
 			newObjects, err := be.conn.Objects(ctx, be.container, opts)
-			be.sem.ReleaseToken()
 
 			if err != nil {
 				return nil, errors.Wrap(err, "conn.ObjectNames")
@@ -267,7 +214,7 @@ func (be *beSwift) List(ctx context.Context, t restic.FileType, fn func(restic.F
 					continue
 				}
 
-				fi := restic.FileInfo{
+				fi := backend.FileInfo{
 					Name: m,
 					Size: obj.Bytes,
 				}
@@ -291,17 +238,22 @@ func (be *beSwift) List(ctx context.Context, t restic.FileType, fn func(restic.F
 	return ctx.Err()
 }
 
-// Remove keys for a specified backend type.
-func (be *beSwift) removeKeys(ctx context.Context, t restic.FileType) error {
-	return be.List(ctx, t, func(fi restic.FileInfo) error {
-		return be.Remove(ctx, restic.Handle{Type: t, Name: fi.Name})
-	})
-}
-
 // IsNotExist returns true if the error is caused by a not existing file.
 func (be *beSwift) IsNotExist(err error) bool {
-	if e, ok := errors.Cause(err).(*swift.Error); ok {
-		return e.StatusCode == http.StatusNotFound
+	var e *swift.Error
+	return errors.As(err, &e) && e.StatusCode == http.StatusNotFound
+}
+
+func (be *beSwift) IsPermanentError(err error) bool {
+	if be.IsNotExist(err) {
+		return true
+	}
+
+	var serr *swift.Error
+	if errors.As(err, &serr) {
+		if serr.StatusCode == http.StatusRequestedRangeNotSatisfiable || serr.StatusCode == http.StatusUnauthorized || serr.StatusCode == http.StatusForbidden {
+			return true
+		}
 	}
 
 	return false
@@ -310,27 +262,14 @@ func (be *beSwift) IsNotExist(err error) bool {
 // Delete removes all restic objects in the container.
 // It will not remove the container itself.
 func (be *beSwift) Delete(ctx context.Context) error {
-	alltypes := []restic.FileType{
-		restic.PackFile,
-		restic.KeyFile,
-		restic.LockFile,
-		restic.SnapshotFile,
-		restic.IndexFile}
-
-	for _, t := range alltypes {
-		err := be.removeKeys(ctx, t)
-		if err != nil {
-			return nil
-		}
-	}
-
-	err := be.Remove(ctx, restic.Handle{Type: restic.ConfigFile})
-	if err != nil && !be.IsNotExist(err) {
-		return err
-	}
-
-	return nil
+	return util.DefaultDelete(ctx, be)
 }
 
 // Close does nothing
 func (be *beSwift) Close() error { return nil }
+
+// Warmup not implemented
+func (be *beSwift) Warmup(_ context.Context, _ []backend.Handle) ([]backend.Handle, error) {
+	return []backend.Handle{}, nil
+}
+func (be *beSwift) WarmupWait(_ context.Context, _ []backend.Handle) error { return nil }

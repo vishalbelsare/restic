@@ -9,7 +9,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/restic/restic/internal/fs"
-	restictest "github.com/restic/restic/internal/test"
+	rtest "github.com/restic/restic/internal/test"
 )
 
 func TestScanner(t *testing.T) {
@@ -56,8 +56,8 @@ func TestScanner(t *testing.T) {
 					},
 				},
 			},
-			selFn: func(item string, fi os.FileInfo) bool {
-				if fi.IsDir() {
+			selFn: func(item string, fi *fs.ExtendedFileInfo, fs fs.FS) bool {
+				if fi.Mode.IsDir() {
 					return true
 				}
 
@@ -78,15 +78,12 @@ func TestScanner(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
+			ctx := t.Context()
 
-			tempdir, cleanup := restictest.TempDir(t)
-			defer cleanup()
-
+			tempdir := rtest.TempDir(t)
 			TestCreateFiles(t, tempdir, test.src)
 
-			back := restictest.Chdir(t, tempdir)
+			back := rtest.Chdir(t, tempdir)
 			defer back()
 
 			cur, err := os.Getwd()
@@ -94,7 +91,7 @@ func TestScanner(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			sc := NewScanner(fs.Track{FS: fs.Local{}})
+			sc := NewScanner(fs.Track{FS: fs.NewLocal()})
 			if test.selFn != nil {
 				sc.Select = test.selFn
 			}
@@ -133,7 +130,7 @@ func TestScannerError(t *testing.T) {
 		src     TestDir
 		result  ScanStats
 		selFn   SelectFunc
-		errFn   func(t testing.TB, item string, fi os.FileInfo, err error) error
+		errFn   func(t testing.TB, item string, err error) error
 		resFn   func(t testing.TB, item string, s ScanStats)
 		prepare func(t testing.TB)
 	}{
@@ -173,7 +170,7 @@ func TestScannerError(t *testing.T) {
 					t.Fatal(err)
 				}
 			},
-			errFn: func(t testing.TB, item string, fi os.FileInfo, err error) error {
+			errFn: func(t testing.TB, item string, err error) error {
 				if item == filepath.FromSlash("work/subdir") {
 					return nil
 				}
@@ -198,7 +195,7 @@ func TestScannerError(t *testing.T) {
 					}
 				}
 			},
-			errFn: func(t testing.TB, item string, fi os.FileInfo, err error) error {
+			errFn: func(t testing.TB, item string, err error) error {
 				if item == "foo" {
 					t.Logf("ignoring error for %v: %v", item, err)
 					return nil
@@ -215,15 +212,12 @@ func TestScannerError(t *testing.T) {
 				t.Skipf("skip on windows")
 			}
 
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
+			ctx := t.Context()
 
-			tempdir, cleanup := restictest.TempDir(t)
-			defer cleanup()
-
+			tempdir := rtest.TempDir(t)
 			TestCreateFiles(t, tempdir, test.src)
 
-			back := restictest.Chdir(t, tempdir)
+			back := rtest.Chdir(t, tempdir)
 			defer back()
 
 			cur, err := os.Getwd()
@@ -235,7 +229,7 @@ func TestScannerError(t *testing.T) {
 				test.prepare(t)
 			}
 
-			sc := NewScanner(fs.Track{FS: fs.Local{}})
+			sc := NewScanner(fs.Track{FS: fs.NewLocal()})
 			if test.selFn != nil {
 				sc.Select = test.selFn
 			}
@@ -257,13 +251,13 @@ func TestScannerError(t *testing.T) {
 				}
 			}
 			if test.errFn != nil {
-				sc.Error = func(item string, fi os.FileInfo, err error) error {
+				sc.Error = func(item string, err error) error {
 					p, relErr := filepath.Rel(cur, item)
 					if relErr != nil {
 						panic(relErr)
 					}
 
-					return test.errFn(t, p, fi, err)
+					return test.errFn(t, p, err)
 				}
 			}
 
@@ -292,12 +286,10 @@ func TestScannerCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	tempdir, cleanup := restictest.TempDir(t)
-	defer cleanup()
-
+	tempdir := rtest.TempDir(t)
 	TestCreateFiles(t, tempdir, src)
 
-	back := restictest.Chdir(t, tempdir)
+	back := rtest.Chdir(t, tempdir)
 	defer back()
 
 	cur, err := os.Getwd()
@@ -305,7 +297,7 @@ func TestScannerCancel(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sc := NewScanner(fs.Track{FS: fs.Local{}})
+	sc := NewScanner(fs.Track{FS: fs.NewLocal()})
 	var lastStats ScanStats
 	sc.Result = func(item string, s ScanStats) {
 		lastStats = s

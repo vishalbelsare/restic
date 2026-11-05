@@ -9,7 +9,7 @@ import (
 	"github.com/restic/restic/internal/fs"
 )
 
-// Tree recursively defines how a snapshot should look like when
+// tree recursively defines how a snapshot should look like when
 // archived.
 //
 // When `Path` is set, this is a leaf node and the contents of `Path` should be
@@ -20,11 +20,12 @@ import (
 //
 // `FileInfoPath` is used to extract metadata for intermediate (=non-leaf)
 // trees.
-type Tree struct {
-	Nodes        map[string]Tree
+type tree struct {
+	Nodes        map[string]tree
 	Path         string // where the files/dirs to be saved are found
 	FileInfoPath string // where the dir can be found that is not included itself, but its subdirs
 	Root         string // parent directory of the tree
+	Explicit     bool   // Explicit is true when Path was passed as a backup target
 }
 
 // pathComponents returns all path components of p. If a virtual directory
@@ -94,14 +95,15 @@ func rootDirectory(fs fs.FS, target string) string {
 	return rel
 }
 
-// Add adds a new file or directory to the tree.
-func (t *Tree) Add(fs fs.FS, path string) error {
+// Add adds a new file or directory to the tree. explicit marks a path the user
+// named as a backup target (see BackupTarget.Explicit).
+func (t *tree) Add(fs fs.FS, path string, explicit bool) error {
 	if path == "" {
 		panic("invalid path (empty string)")
 	}
 
 	if t.Nodes == nil {
-		t.Nodes = make(map[string]Tree)
+		t.Nodes = make(map[string]tree)
 	}
 
 	pc, virtualPrefix := pathComponents(fs, path, false)
@@ -111,7 +113,7 @@ func (t *Tree) Add(fs fs.FS, path string) error {
 
 	name := pc[0]
 	root := rootDirectory(fs, path)
-	tree := Tree{Root: root}
+	tree := tree{Root: root}
 
 	origName := name
 	i := 0
@@ -138,13 +140,14 @@ func (t *Tree) Add(fs fs.FS, path string) error {
 			// use the original root dir if this is a virtual directory (volume name on Windows)
 			subroot = root
 		}
-		err := tree.add(fs, path, subroot, pc[1:])
+		err := tree.add(fs, path, subroot, pc[1:], explicit)
 		if err != nil {
 			return err
 		}
 		tree.FileInfoPath = subroot
 	} else {
 		tree.Path = path
+		tree.Explicit = explicit
 	}
 
 	t.Nodes[name] = tree
@@ -152,63 +155,64 @@ func (t *Tree) Add(fs fs.FS, path string) error {
 }
 
 // add adds a new target path into the tree.
-func (t *Tree) add(fs fs.FS, target, root string, pc []string) error {
+func (t *tree) add(fs fs.FS, target, root string, pc []string, explicit bool) error {
 	if len(pc) == 0 {
 		return errors.Errorf("invalid path %q", target)
 	}
 
 	if t.Nodes == nil {
-		t.Nodes = make(map[string]Tree)
+		t.Nodes = make(map[string]tree)
 	}
 
 	name := pc[0]
 
 	if len(pc) == 1 {
-		tree, ok := t.Nodes[name]
+		node, ok := t.Nodes[name]
 
 		if !ok {
-			t.Nodes[name] = Tree{Path: target}
+			t.Nodes[name] = tree{Path: target, Explicit: explicit}
 			return nil
 		}
 
-		if tree.Path != "" {
+		if node.Path != "" {
 			return errors.Errorf("path is already set for target %v", target)
 		}
-		tree.Path = target
-		t.Nodes[name] = tree
+		node.Path = target
+		node.Explicit = explicit
+		t.Nodes[name] = node
 		return nil
 	}
 
-	tree := Tree{}
+	node := tree{}
 	if other, ok := t.Nodes[name]; ok {
-		tree = other
+		node = other
 	}
 
 	subroot := fs.Join(root, name)
-	tree.FileInfoPath = subroot
+	node.FileInfoPath = subroot
 
-	err := tree.add(fs, target, subroot, pc[1:])
+	err := node.add(fs, target, subroot, pc[1:], explicit)
 	if err != nil {
 		return err
 	}
-	t.Nodes[name] = tree
+	t.Nodes[name] = node
 
 	return nil
 }
 
-func (t Tree) String() string {
+func (t tree) String() string {
 	return formatTree(t, "")
 }
 
 // Leaf returns true if this is a leaf node, which means Path is set to a
 // non-empty string and the contents of Path should be inserted at this point
 // in the tree.
-func (t Tree) Leaf() bool {
+func (t tree) Leaf() bool {
 	return t.Path != ""
 }
 
 // NodeNames returns the sorted list of subtree names.
-func (t Tree) NodeNames() []string {
+func (t tree) NodeNames() []string {
 	// iterate over the nodes of atree in lexicographic (=deterministic) order
 	names := make([]string, 0, len(t.Nodes))
 	for name := range t.Nodes {
@@ -219,21 +223,21 @@ func (t Tree) NodeNames() []string {
 }
 
 // formatTree returns a text representation of the tree t.
-func formatTree(t Tree, indent string) (s string) {
+func formatTree(t tree, indent string) (s string) {
 	for name, node := range t.Nodes {
-		s += fmt.Sprintf("%v/%v, root %q, path %q, meta %q\n", indent, name, node.Root, node.Path, node.FileInfoPath)
+		s += fmt.Sprintf("%v/%v, root %q, path %q, meta %q, explicit %v\n", indent, name, node.Root, node.Path, node.FileInfoPath, node.Explicit)
 		s += formatTree(node, indent+"    ")
 	}
 	return s
 }
 
 // unrollTree unrolls the tree so that only leaf nodes have Path set.
-func unrollTree(f fs.FS, t *Tree) error {
+func unrollTree(f fs.FS, t *tree) error {
 	// if the current tree is a leaf node (Path is set) and has additional
 	// nodes, add the contents of Path to the nodes.
 	if t.Path != "" && len(t.Nodes) > 0 {
 		debug.Log("resolve path %v", t.Path)
-		entries, err := readdirnames(f, t.Path, 0)
+		entries, err := fs.Readdirnames(f, t.Path, 0)
 		if err != nil {
 			return err
 		}
@@ -252,9 +256,10 @@ func unrollTree(f fs.FS, t *Tree) error {
 
 				return errors.Errorf("tree unrollTree: collision on path, node %#v, path %q", node, f.Join(t.Path, entry))
 			}
-			t.Nodes[entry] = Tree{Path: f.Join(t.Path, entry)}
+			t.Nodes[entry] = tree{Path: f.Join(t.Path, entry)}
 		}
 		t.Path = ""
+		t.Explicit = false
 	}
 
 	for i, subtree := range t.Nodes {
@@ -269,13 +274,21 @@ func unrollTree(f fs.FS, t *Tree) error {
 	return nil
 }
 
-// NewTree creates a Tree from the target files/directories.
-func NewTree(fs fs.FS, targets []string) (*Tree, error) {
+// backupTarget is a resolved backup path and whether the user passed this path
+// literally. Paths inserted when expanding a target with no path components
+// (for example ".") have Explicit false so include/exclude rules still apply.
+type backupTarget struct {
+	Path     string
+	Explicit bool
+}
+
+// newTree creates a Tree from the target files/directories.
+func newTree(fs fs.FS, targets []backupTarget) (*tree, error) {
 	debug.Log("targets: %v", targets)
-	tree := &Tree{}
+	tree := &tree{}
 	seen := make(map[string]struct{})
-	for _, target := range targets {
-		target = fs.Clean(target)
+	for _, tgt := range targets {
+		target := fs.Clean(tgt.Path)
 
 		// skip duplicate targets
 		if _, ok := seen[target]; ok {
@@ -283,7 +296,7 @@ func NewTree(fs fs.FS, targets []string) (*Tree, error) {
 		}
 		seen[target] = struct{}{}
 
-		err := tree.Add(fs, target)
+		err := tree.Add(fs, target, tgt.Explicit)
 		if err != nil {
 			return nil, err
 		}

@@ -2,8 +2,6 @@ package archiver
 
 import (
 	"context"
-	"os"
-	"path/filepath"
 	"sort"
 
 	"github.com/restic/restic/internal/debug"
@@ -22,13 +20,13 @@ type Scanner struct {
 }
 
 // NewScanner initializes a new Scanner.
-func NewScanner(fs fs.FS) *Scanner {
+func NewScanner(filesystem fs.FS) *Scanner {
 	return &Scanner{
-		FS:           fs,
-		SelectByName: func(item string) bool { return true },
-		Select:       func(item string, fi os.FileInfo) bool { return true },
-		Error:        func(item string, fi os.FileInfo, err error) error { return err },
-		Result:       func(item string, s ScanStats) {},
+		FS:           filesystem,
+		SelectByName: func(_ string) bool { return true },
+		Select:       func(_ string, _ *fs.ExtendedFileInfo, _ fs.FS) bool { return true },
+		Error:        func(_ string, err error) error { return err },
+		Result:       func(_ string, _ ScanStats) {},
 	}
 }
 
@@ -38,7 +36,7 @@ type ScanStats struct {
 	Bytes               uint64
 }
 
-func (s *Scanner) scanTree(ctx context.Context, stats ScanStats, tree Tree) (ScanStats, error) {
+func (s *Scanner) scanTree(ctx context.Context, stats ScanStats, tree tree) (ScanStats, error) {
 	// traverse the path in the file system for all leaf nodes
 	if tree.Leaf() {
 		abstarget, err := s.FS.Abs(tree.Path)
@@ -46,7 +44,7 @@ func (s *Scanner) scanTree(ctx context.Context, stats ScanStats, tree Tree) (Sca
 			return ScanStats{}, err
 		}
 
-		stats, err = s.scan(ctx, stats, abstarget)
+		stats, err = s.scan(ctx, stats, abstarget, tree.Explicit)
 		if err != nil {
 			return ScanStats{}, err
 		}
@@ -83,7 +81,7 @@ func (s *Scanner) Scan(ctx context.Context, targets []string) error {
 	debug.Log("clean targets %v", cleanTargets)
 
 	// we're using the same tree representation as the archiver does
-	tree, err := NewTree(s.FS, cleanTargets)
+	tree, err := newTree(s.FS, cleanTargets)
 	if err != nil {
 		return err
 	}
@@ -98,40 +96,41 @@ func (s *Scanner) Scan(ctx context.Context, targets []string) error {
 	return nil
 }
 
-func (s *Scanner) scan(ctx context.Context, stats ScanStats, target string) (ScanStats, error) {
+// explicit is true when this path was an explicit backup target (same meaning as tree.Explicit on a leaf).
+func (s *Scanner) scan(ctx context.Context, stats ScanStats, target string, explicit bool) (ScanStats, error) {
 	if ctx.Err() != nil {
 		return stats, nil
 	}
 
 	// exclude files by path before running stat to reduce number of lstat calls
-	if !s.SelectByName(target) {
+	if !explicit && !s.SelectByName(target) {
 		return stats, nil
 	}
 
 	// get file information
 	fi, err := s.FS.Lstat(target)
 	if err != nil {
-		return stats, s.Error(target, fi, err)
+		return stats, s.Error(target, err)
 	}
 
 	// run remaining select functions that require file information
-	if !s.Select(target, fi) {
+	if !explicit && !s.Select(target, fi, s.FS) {
 		return stats, nil
 	}
 
 	switch {
-	case fi.Mode().IsRegular():
+	case fi.Mode.IsRegular():
 		stats.Files++
-		stats.Bytes += uint64(fi.Size())
-	case fi.Mode().IsDir():
-		names, err := readdirnames(s.FS, target, fs.O_NOFOLLOW)
+		stats.Bytes += uint64(fi.Size)
+	case fi.Mode.IsDir():
+		names, err := fs.Readdirnames(s.FS, target, fs.O_NOFOLLOW)
 		if err != nil {
-			return stats, s.Error(target, fi, err)
+			return stats, s.Error(target, err)
 		}
 		sort.Strings(names)
 
 		for _, name := range names {
-			stats, err = s.scan(ctx, stats, filepath.Join(target, name))
+			stats, err = s.scan(ctx, stats, s.FS.Join(target, name), false)
 			if err != nil {
 				return stats, err
 			}

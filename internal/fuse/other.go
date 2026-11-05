@@ -1,29 +1,35 @@
-// +build darwin freebsd linux
+//go:build darwin || freebsd || linux
 
 package fuse
 
 import (
 	"context"
 
-	"bazil.org/fuse"
-	"github.com/restic/restic/internal/restic"
+	"github.com/anacrolix/fuse"
+	"github.com/anacrolix/fuse/fs"
+	"github.com/restic/restic/internal/data"
 )
 
+// Statically ensure that *other implements the given interface
+var _ = fs.NodeForgetter(&other{})
+var _ = fs.NodeReadlinker(&other{})
+
 type other struct {
-	root  *Root
-	node  *restic.Node
-	inode uint64
+	root   *Root
+	forget forgetFn
+	node   *data.Node
+	inode  uint64
 }
 
-func newOther(ctx context.Context, root *Root, inode uint64, node *restic.Node) (*other, error) {
-	return &other{root: root, inode: inode, node: node}, nil
+func newOther(root *Root, forget forgetFn, inode uint64, node *data.Node) (*other, error) {
+	return &other{root: root, forget: forget, inode: inode, node: node}, nil
 }
 
-func (l *other) Readlink(ctx context.Context, req *fuse.ReadlinkRequest) (string, error) {
+func (l *other) Readlink(_ context.Context, _ *fuse.ReadlinkRequest) (string, error) {
 	return l.node.LinkTarget, nil
 }
 
-func (l *other) Attr(ctx context.Context, a *fuse.Attr) error {
+func (l *other) Attr(_ context.Context, a *fuse.Attr) error {
 	a.Inode = l.inode
 	a.Mode = l.node.Mode
 
@@ -38,4 +44,8 @@ func (l *other) Attr(ctx context.Context, a *fuse.Attr) error {
 	a.Nlink = uint32(l.node.Links)
 
 	return nil
+}
+
+func (l *other) Forget() {
+	l.forget()
 }

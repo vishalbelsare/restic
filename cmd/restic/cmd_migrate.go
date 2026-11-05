@@ -1,28 +1,47 @@
 package main
 
 import (
+	"context"
+
+	"github.com/restic/restic/internal/global"
 	"github.com/restic/restic/internal/migrations"
 	"github.com/restic/restic/internal/restic"
+	"github.com/restic/restic/internal/ui"
+	"github.com/restic/restic/internal/ui/progress"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
-var cmdMigrate = &cobra.Command{
-	Use:   "migrate [flags] [name]",
-	Short: "Apply migrations",
-	Long: `
-The "migrate" command applies migrations to a repository. When no migration
-name is explicitly given, a list of migrations that can be applied is printed.
+func newMigrateCommand(globalOptions *global.Options) *cobra.Command {
+	var opts MigrateOptions
+
+	cmd := &cobra.Command{
+		Use:   "migrate [flags] [migration name] [...]",
+		Short: "Apply migrations",
+		Long: `
+The "migrate" command checks which migrations can be applied for a repository
+and prints a list with available migration names. If one or more migration
+names are specified, these migrations are applied.
 
 EXIT STATUS
 ===========
 
-Exit status is 0 if the command was successful, and non-zero if there was any error.
+Exit status is 0 if the command was successful.
+Exit status is 1 if there was any error.
+Exit status is 10 if the repository does not exist.
+Exit status is 11 if the repository is already locked.
+Exit status is 12 if the password is incorrect.
 `,
-	DisableAutoGenTag: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return runMigrate(migrateOptions, globalOptions, args)
-	},
+		DisableAutoGenTag: true,
+		GroupID:           cmdGroupDefault,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runMigrate(cmd.Context(), opts, *globalOptions, args, globalOptions.Term)
+		},
+	}
+
+	opts.AddFlags(cmd.Flags())
+	return cmd
 }
 
 // MigrateOptions bundles all options for the 'check' command.
@@ -30,84 +49,103 @@ type MigrateOptions struct {
 	Force bool
 }
 
-var migrateOptions MigrateOptions
-
-func init() {
-	cmdRoot.AddCommand(cmdMigrate)
-	f := cmdMigrate.Flags()
-	f.BoolVarP(&migrateOptions.Force, "force", "f", false, `apply a migration a second time`)
+func (opts *MigrateOptions) AddFlags(f *pflag.FlagSet) {
+	f.BoolVarP(&opts.Force, "force", "f", false, `apply a migration a second time`)
 }
 
-func checkMigrations(opts MigrateOptions, gopts GlobalOptions, repo restic.Repository) error {
-	ctx := gopts.ctx
-	Printf("available migrations:\n")
+func checkMigrations(ctx context.Context, repo restic.Repository, printer restic.Printer) error {
+	printer.P("available migrations:\n")
+	found := false
+
 	for _, m := range migrations.All {
-		ok, err := m.Check(ctx, repo)
+		ok, _, err := m.Check(ctx, repo)
 		if err != nil {
 			return err
 		}
 
 		if ok {
-			Printf("  %v: %v\n", m.Name(), m.Desc())
+			printer.P("  %v\t%v\n", m.Name(), m.Desc())
+			found = true
 		}
+	}
+
+	if !found {
+		printer.P("no migrations found\n")
 	}
 
 	return nil
 }
 
-func applyMigrations(opts MigrateOptions, gopts GlobalOptions, repo restic.Repository, args []string) error {
-	ctx := gopts.ctx
-
+func applyMigrations(ctx context.Context, opts MigrateOptions, gopts global.Options, repo restic.Repository, args []string, term ui.Terminal, printer restic.Printer) error {
 	var firsterr error
 	for _, name := range args {
+		found := false
 		for _, m := range migrations.All {
 			if m.Name() == name {
-				ok, err := m.Check(ctx, repo)
+				found = true
+				ok, reason, err := m.Check(ctx, repo)
 				if err != nil {
 					return err
 				}
 
 				if !ok {
 					if !opts.Force {
-						Warnf("migration %v cannot be applied: check failed\nIf you want to apply this migration anyway, re-run with option --force\n", m.Name())
+						if reason == "" {
+							reason = "check failed"
+						}
+						printer.E("migration %v cannot be applied: %v\nIf you want to apply this migration anyway, re-run with option --force\n", m.Name(), reason)
 						continue
 					}
 
-					Warnf("check for migration %v failed, continuing anyway\n", m.Name())
+					printer.E("check for migration %v failed, continuing anyway\n", m.Name())
 				}
 
-				Printf("applying migration %v...\n", m.Name())
+				if m.RepoCheck() {
+					printer.P("checking repository integrity...\n")
+
+					checkOptions := CheckOptions{}
+					checkGopts := gopts
+					// the repository is already locked
+					checkGopts.NoLock = true
+
+					_, err = runCheck(ctx, checkOptions, checkGopts, []string{}, term)
+					if err != nil {
+						return err
+					}
+				}
+
+				printer.P("applying migration %v...\n", m.Name())
 				if err = m.Apply(ctx, repo); err != nil {
-					Warnf("migration %v failed: %v\n", m.Name(), err)
+					printer.E("migration %v failed: %v\n", m.Name(), err)
 					if firsterr == nil {
 						firsterr = err
 					}
 					continue
 				}
 
-				Printf("migration %v: success\n", m.Name())
+				printer.P("migration %v: success\n", m.Name())
 			}
+		}
+		if !found {
+			printer.E("unknown migration %v", name)
 		}
 	}
 
 	return firsterr
 }
 
-func runMigrate(opts MigrateOptions, gopts GlobalOptions, args []string) error {
-	repo, err := OpenRepository(gopts)
-	if err != nil {
-		return err
-	}
+func runMigrate(ctx context.Context, opts MigrateOptions, gopts global.Options, args []string, term ui.Terminal) error {
+	printer := progress.NewTerminalPrinter(false, gopts.Verbosity, term)
 
-	lock, err := lockRepoExclusive(gopts.ctx, repo)
-	defer unlockRepo(lock)
+	ctx, repo, unlock, err := openWithExclusiveLock(ctx, gopts, false, printer)
 	if err != nil {
 		return err
 	}
+	defer unlock()
 
 	if len(args) == 0 {
-		return checkMigrations(opts, gopts, repo)
+		return checkMigrations(ctx, repo, printer)
 	}
 
-	return applyMigrations(opts, gopts, repo, args)
+	return applyMigrations(ctx, opts, gopts, repo, args, term, printer)
 }

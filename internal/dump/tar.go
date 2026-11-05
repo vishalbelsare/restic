@@ -3,15 +3,16 @@ package dump
 import (
 	"archive/tar"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
+	"github.com/restic/restic/internal/data"
+	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/errors"
-	"github.com/restic/restic/internal/restic"
 )
 
-func (d *Dumper) dumpTar(ctx context.Context, ch <-chan *restic.Node) (err error) {
+func (d *Dumper) dumpTar(ctx context.Context, ch <-chan *data.Node) (err error) {
 	w := tar.NewWriter(d.w)
 
 	defer func() {
@@ -38,7 +39,16 @@ const (
 	cISVTX = 0o1000 // Save text (sticky bit)
 )
 
-func (d *Dumper) dumpNodeTar(ctx context.Context, node *restic.Node, w *tar.Writer) error {
+// in a 32-bit build of restic:
+// substitute a uid or gid of -1 (which was converted to 2^32 - 1) with 0
+func tarIdentifier(id uint32) int {
+	if int(id) == -1 {
+		return 0
+	}
+	return int(id)
+}
+
+func (d *Dumper) dumpNodeTar(ctx context.Context, node *data.Node, w *tar.Writer) error {
 	relPath, err := filepath.Rel("/", node.Path)
 	if err != nil {
 		return err
@@ -48,8 +58,8 @@ func (d *Dumper) dumpNodeTar(ctx context.Context, node *restic.Node, w *tar.Writ
 		Name:       filepath.ToSlash(relPath),
 		Size:       int64(node.Size),
 		Mode:       int64(node.Mode.Perm()), // cIS* constants are added later
-		Uid:        int(node.UID),
-		Gid:        int(node.GID),
+		Uid:        tarIdentifier(node.UID),
+		Gid:        tarIdentifier(node.GID),
 		Uname:      node.User,
 		Gname:      node.Group,
 		ModTime:    node.ModTime,
@@ -69,47 +79,53 @@ func (d *Dumper) dumpNodeTar(ctx context.Context, node *restic.Node, w *tar.Writ
 		header.Mode |= cISVTX
 	}
 
-	if IsFile(node) {
+	if node.Type == data.NodeTypeFile {
 		header.Typeflag = tar.TypeReg
 	}
 
-	if IsLink(node) {
+	if node.Type == data.NodeTypeSymlink {
 		header.Typeflag = tar.TypeSymlink
 		header.Linkname = node.LinkTarget
 	}
 
-	if IsDir(node) {
+	if node.Type == data.NodeTypeDir {
 		header.Typeflag = tar.TypeDir
 		header.Name += "/"
 	}
 
 	err = w.WriteHeader(header)
 	if err != nil {
-		return errors.Wrap(err, "TarHeader")
+		return fmt.Errorf("writing header for %q: %w", node.Path, err)
 	}
-
 	return d.writeNode(ctx, w, node)
 }
 
-func parseXattrs(xattrs []restic.ExtendedAttribute) map[string]string {
+func parseXattrs(xattrs []data.ExtendedAttribute) map[string]string {
 	tmpMap := make(map[string]string)
 
 	for _, attr := range xattrs {
-		attrString := string(attr.Value)
+		// Check for Linux POSIX.1e ACLs.
+		//
+		// TODO support ACLs from other operating systems.
+		// FreeBSD ACLs have names "posix1e.acl_(access|default)",
+		// but their binary format may not match the Linux format.
+		aclKey := ""
+		switch attr.Name {
+		case "system.posix_acl_access":
+			aclKey = "SCHILY.acl.access"
+		case "system.posix_acl_default":
+			aclKey = "SCHILY.acl.default"
+		}
 
-		if strings.HasPrefix(attr.Name, "system.posix_acl_") {
-			na := acl{}
-			na.decode(attr.Value)
-
-			if na.String() != "" {
-				if strings.Contains(attr.Name, "system.posix_acl_access") {
-					tmpMap["SCHILY.acl.access"] = na.String()
-				} else if strings.Contains(attr.Name, "system.posix_acl_default") {
-					tmpMap["SCHILY.acl.default"] = na.String()
-				}
+		if aclKey != "" {
+			text, err := formatLinuxACL(attr.Value)
+			if err != nil {
+				debug.Log("parsing Linux ACL: %v, skipping", err)
+				continue
 			}
+			tmpMap[aclKey] = text
 		} else {
-			tmpMap["SCHILY.xattr."+attr.Name] = attrString
+			tmpMap["SCHILY.xattr."+attr.Name] = string(attr.Value)
 		}
 	}
 

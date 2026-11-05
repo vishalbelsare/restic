@@ -16,7 +16,7 @@ type Options map[string]string
 var opts []Help
 
 // Register allows registering options so that they can be listed with List.
-func Register(ns string, cfg interface{}) {
+func Register(ns string, cfg any) {
 	opts = appendAllOptions(opts, ns, cfg)
 }
 
@@ -28,7 +28,7 @@ func List() (list []Help) {
 }
 
 // appendAllOptions appends all options in cfg to opts, sorted by namespace.
-func appendAllOptions(opts []Help, ns string, cfg interface{}) []Help {
+func appendAllOptions(opts []Help, ns string, cfg any) []Help {
 	for _, opt := range listOptions(cfg) {
 		opt.Namespace = ns
 		opts = append(opts, opt)
@@ -39,7 +39,7 @@ func appendAllOptions(opts []Help, ns string, cfg interface{}) []Help {
 }
 
 // listOptions returns a list of options of cfg.
-func listOptions(cfg interface{}) (opts []Help) {
+func listOptions(cfg any) (opts []Help) {
 	// resolve indirection if cfg is a pointer
 	v := reflect.Indirect(reflect.ValueOf(cfg))
 
@@ -92,14 +92,10 @@ func (h helpList) Swap(i, j int) {
 
 // splitKeyValue splits at the first equals (=) sign.
 func splitKeyValue(s string) (key string, value string) {
-	data := strings.SplitN(s, "=", 2)
-	key = strings.ToLower(strings.TrimSpace(data[0]))
-	if len(data) == 1 {
-		// no equals sign is treated as the empty value
-		return key, ""
-	}
-
-	return key, strings.TrimSpace(data[1])
+	key, value, _ = strings.Cut(s, "=")
+	key = strings.ToLower(strings.TrimSpace(key))
+	value = strings.TrimSpace(value)
+	return key, value
 }
 
 // Parse takes a slice of key=value pairs and returns an Options type.
@@ -149,7 +145,7 @@ func (o Options) Extract(ns string) Options {
 
 // Apply sets the options on dst via reflection, using the struct tag `option`.
 // The namespace argument (ns) is only used for error messages.
-func (o Options) Apply(ns string, dst interface{}) error {
+func (o Options) Apply(ns string, dst any) error {
 	v := reflect.ValueOf(dst).Elem()
 
 	fields := make(map[string]reflect.StructField)

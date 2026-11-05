@@ -1,9 +1,8 @@
-// +build !windows
+//go:build !windows
 
 package fs
 
 import (
-	"io/ioutil"
 	"os"
 	"syscall"
 )
@@ -14,22 +13,7 @@ func fixpath(name string) string {
 	return name
 }
 
-// TempFile creates a temporary file which has already been deleted (on
-// supported platforms)
-func TempFile(dir, prefix string) (f *os.File, err error) {
-	f, err = ioutil.TempFile(dir, prefix)
-	if err != nil {
-		return nil, err
-	}
-
-	if err = os.Remove(f.Name()); err != nil {
-		return nil, err
-	}
-
-	return f, nil
-}
-
-// isNotSuported returns true if the error is caused by an unsupported file system feature.
+// isNotSupported returns true if the error is caused by an unsupported file system feature.
 func isNotSupported(err error) bool {
 	if perr, ok := err.(*os.PathError); ok && perr.Err == syscall.ENOTSUP {
 		return true
@@ -37,8 +21,8 @@ func isNotSupported(err error) bool {
 	return false
 }
 
-// Chmod changes the mode of the named file to mode.
-func Chmod(name string, mode os.FileMode) error {
+// chmod changes the mode of the named file to mode.
+func chmod(name string, mode os.FileMode) error {
 	err := os.Chmod(fixpath(name), mode)
 
 	// ignore the error if the FS does not support setting this mode (e.g. CIFS with gvfs on Linux)

@@ -3,10 +3,10 @@ package walker
 import (
 	"context"
 	"path"
-	"sort"
 
 	"github.com/pkg/errors"
 
+	"github.com/restic/restic/internal/data"
 	"github.com/restic/restic/internal/restic"
 )
 
@@ -15,27 +15,28 @@ var ErrSkipNode = errors.New("skip this node")
 
 // WalkFunc is the type of the function called for each node visited by Walk.
 // Path is the slash-separated path from the root node. If there was a problem
-// loading a node, err is set to a non-nil error. WalkFunc can chose to ignore
+// loading a node, err is set to a non-nil error. WalkFunc can choose to ignore
 // it by returning nil.
 //
 // When the special value ErrSkipNode is returned and node is a dir node, it is
 // not walked. When the node is not a dir node, the remaining items in this
 // tree are skipped.
-//
-// Setting ignore to true tells Walk that it should not visit the node again.
-// For tree nodes, this means that the function is not called for the
-// referenced tree. If the node is not a tree, and all nodes in the current
-// tree have ignore set to true, the current tree will not be visited again.
-// When err is not nil and different from ErrSkipNode, the value returned for
-// ignore is ignored.
-type WalkFunc func(parentTreeID restic.ID, path string, node *restic.Node, nodeErr error) (ignore bool, err error)
+type WalkFunc func(parentTreeID restic.ID, path string, node *data.Node, nodeErr error) (err error)
+
+type WalkVisitor struct {
+	// If the node is a `dir`, it will be entered afterwards unless `ErrSkipNode`
+	// was returned. This function is mandatory
+	ProcessNode WalkFunc
+	// Optional callback
+	LeaveDir func(path string) error
+}
 
 // Walk calls walkFn recursively for each node in root. If walkFn returns an
 // error, it is passed up the call stack. The trees in ignoreTrees are not
 // walked. If walkFn ignores trees, these are added to the set.
-func Walk(ctx context.Context, repo restic.TreeLoader, root restic.ID, ignoreTrees restic.IDSet, walkFn WalkFunc) error {
-	tree, err := repo.LoadTree(ctx, root)
-	_, err = walkFn(root, "/", nil, err)
+func Walk(ctx context.Context, repo restic.BlobLoader, root restic.ID, visitor WalkVisitor) error {
+	tree, err := data.LoadTree(ctx, repo, root)
+	err = visitor.ProcessNode(root, "/", nil, err)
 
 	if err != nil {
 		if err == ErrSkipNode {
@@ -44,94 +45,65 @@ func Walk(ctx context.Context, repo restic.TreeLoader, root restic.ID, ignoreTre
 		return err
 	}
 
-	if ignoreTrees == nil {
-		ignoreTrees = restic.NewIDSet()
-	}
-
-	_, err = walk(ctx, repo, "/", root, tree, ignoreTrees, walkFn)
-	return err
+	return walk(ctx, repo, "/", root, tree, visitor)
 }
 
 // walk recursively traverses the tree, ignoring subtrees when the ID of the
 // subtree is in ignoreTrees. If err is nil and ignore is true, the subtree ID
 // will be added to ignoreTrees by walk.
-func walk(ctx context.Context, repo restic.TreeLoader, prefix string, parentTreeID restic.ID, tree *restic.Tree, ignoreTrees restic.IDSet, walkFn WalkFunc) (ignore bool, err error) {
-	var allNodesIgnored = true
+func walk(ctx context.Context, repo restic.BlobLoader, prefix string, parentTreeID restic.ID, tree data.TreeNodeIterator, visitor WalkVisitor) (err error) {
+	for item := range tree {
+		if item.Error != nil {
+			return item.Error
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		node := item.Node
 
-	if len(tree.Nodes) == 0 {
-		allNodesIgnored = false
-	}
-
-	sort.Slice(tree.Nodes, func(i, j int) bool {
-		return tree.Nodes[i].Name < tree.Nodes[j].Name
-	})
-
-	for _, node := range tree.Nodes {
 		p := path.Join(prefix, node.Name)
 
-		if node.Type == "" {
-			return false, errors.Errorf("node type is empty for node %q", node.Name)
+		if node.Type == data.NodeTypeInvalid {
+			return errors.Errorf("node type is empty for node %q", node.Name)
 		}
 
-		if node.Type != "dir" {
-			ignore, err := walkFn(parentTreeID, p, node, nil)
+		if node.Type != data.NodeTypeDir {
+			err := visitor.ProcessNode(parentTreeID, p, node, nil)
 			if err != nil {
 				if err == ErrSkipNode {
 					// skip the remaining entries in this tree
-					return allNodesIgnored, nil
+					break
 				}
 
-				return false, err
-			}
-
-			if !ignore {
-				allNodesIgnored = false
+				return err
 			}
 
 			continue
 		}
 
 		if node.Subtree == nil {
-			return false, errors.Errorf("subtree for node %v in tree %v is nil", node.Name, p)
+			return errors.Errorf("subtree for node %v in tree %v is nil", node.Name, p)
 		}
 
-		if ignoreTrees.Has(*node.Subtree) {
-			continue
-		}
-
-		subtree, err := repo.LoadTree(ctx, *node.Subtree)
-		ignore, err := walkFn(parentTreeID, p, node, err)
+		subtree, err := data.LoadTree(ctx, repo, *node.Subtree)
+		err = visitor.ProcessNode(parentTreeID, p, node, err)
 		if err != nil {
 			if err == ErrSkipNode {
-				if ignore {
-					ignoreTrees.Insert(*node.Subtree)
-				}
 				continue
 			}
-			return false, err
+
+			return err
 		}
 
-		if ignore {
-			ignoreTrees.Insert(*node.Subtree)
-		}
-
-		if !ignore {
-			allNodesIgnored = false
-		}
-
-		ignore, err = walk(ctx, repo, p, *node.Subtree, subtree, ignoreTrees, walkFn)
+		err = walk(ctx, repo, p, *node.Subtree, subtree, visitor)
 		if err != nil {
-			return false, err
-		}
-
-		if ignore {
-			ignoreTrees.Insert(*node.Subtree)
-		}
-
-		if !ignore {
-			allNodesIgnored = false
+			return err
 		}
 	}
 
-	return allNodesIgnored, nil
+	if visitor.LeaveDir != nil {
+		return visitor.LeaveDir(prefix)
+	}
+
+	return nil
 }

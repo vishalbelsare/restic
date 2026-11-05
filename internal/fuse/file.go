@@ -1,4 +1,4 @@
-// +build darwin freebsd linux
+//go:build darwin || freebsd || linux
 
 package fuse
 
@@ -6,12 +6,13 @@ import (
 	"context"
 	"sort"
 
+	"github.com/restic/restic/internal/data"
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/restic"
 
-	"bazil.org/fuse"
-	"bazil.org/fuse/fs"
+	"github.com/anacrolix/fuse"
+	"github.com/anacrolix/fuse/fs"
 )
 
 // The default block size to report in stat
@@ -19,14 +20,16 @@ const blockSize = 512
 
 // Statically ensure that *file and *openFile implement the given interfaces
 var _ = fs.HandleReader(&openFile{})
-var _ = fs.NodeListxattrer(&file{})
+var _ = fs.NodeForgetter(&file{})
 var _ = fs.NodeGetxattrer(&file{})
+var _ = fs.NodeListxattrer(&file{})
 var _ = fs.NodeOpener(&file{})
 
 type file struct {
-	root  *Root
-	node  *restic.Node
-	inode uint64
+	root   *Root
+	forget forgetFn
+	node   *data.Node
+	inode  uint64
 }
 
 type openFile struct {
@@ -35,23 +38,27 @@ type openFile struct {
 	cumsize []uint64
 }
 
-func newFile(ctx context.Context, root *Root, inode uint64, node *restic.Node) (fusefile *file, err error) {
+func newFile(root *Root, forget forgetFn, inode uint64, node *data.Node) (fusefile *file, err error) {
 	debug.Log("create new file for %v with %d blobs", node.Name, len(node.Content))
 	return &file{
-		inode: inode,
-		root:  root,
-		node:  node,
+		inode:  inode,
+		forget: forget,
+		root:   root,
+		node:   node,
 	}, nil
 }
 
-func (f *file) Attr(ctx context.Context, a *fuse.Attr) error {
+func (f *file) Attr(_ context.Context, a *fuse.Attr) error {
 	debug.Log("Attr(%v)", f.node.Name)
 	a.Inode = f.inode
 	a.Mode = f.node.Mode
 	a.Size = f.node.Size
-	a.Blocks = (f.node.Size / blockSize) + 1
+	a.Blocks = (f.node.Size + blockSize - 1) / blockSize
 	a.BlockSize = blockSize
-	a.Nlink = uint32(f.node.Links)
+	// Windows (and other non-POSIX) backups may store a link count of 0.
+	// FUSE must still report a positive nlink so tools that validate stat()
+	// (e.g. Samba) accept the file.
+	a.Nlink = max(uint32(1), uint32(f.node.Links))
 
 	if !f.root.cfg.OwnerIsRoot {
 		a.Uid = f.node.UID
@@ -65,13 +72,17 @@ func (f *file) Attr(ctx context.Context, a *fuse.Attr) error {
 
 }
 
-func (f *file) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fs.Handle, error) {
+func (f *file) Open(ctx context.Context, _ *fuse.OpenRequest, _ *fuse.OpenResponse) (fs.Handle, error) {
 	debug.Log("open file %v with %d blobs", f.node.Name, len(f.node.Content))
 
 	var bytes uint64
 	cumsize := make([]uint64, 1+len(f.node.Content))
 	for i, id := range f.node.Content {
-		size, found := f.root.repo.LookupBlobSize(id, restic.DataBlob)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
+		size, found := f.root.repo.LookupBlobSize(restic.BlobHandle{Type: restic.DataBlob, ID: id})
 		if !found {
 			return nil, errors.Errorf("id %v not found in repository", id)
 		}
@@ -95,19 +106,13 @@ func (f *file) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 }
 
 func (f *openFile) getBlobAt(ctx context.Context, i int) (blob []byte, err error) {
-
-	blob, ok := f.root.blobCache.Get(f.node.Content[i])
-	if ok {
-		return blob, nil
-	}
-
-	blob, err = f.root.repo.LoadBlob(ctx, restic.DataBlob, f.node.Content[i], nil)
+	blob, err = f.root.blobCache.GetOrCompute(f.node.Content[i], func() ([]byte, error) {
+		return f.root.repo.LoadBlob(ctx, restic.BlobHandle{Type: restic.DataBlob, ID: f.node.Content[i]}, nil)
+	})
 	if err != nil {
 		debug.Log("LoadBlob(%v, %v) failed: %v", f.node.Name, f.node.Content[i], err)
-		return nil, err
+		return nil, unwrapCtxCanceled(err)
 	}
-
-	f.root.blobCache.Add(f.node.Content[i], blob)
 
 	return blob, nil
 }
@@ -141,8 +146,8 @@ func (f *openFile) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.R
 	// Multiple goroutines may call service methods simultaneously;
 	// the methods being called are responsible for appropriate synchronization.
 	//
-	// However, no lock needed here as getBlobAt can be called conurrently
-	// (blobCache has it's own locking)
+	// However, no lock needed here as getBlobAt can be called concurrently
+	// (blobCache has its own locking)
 	for i := startContent; remainingBytes > 0 && i < len(f.cumsize)-1; i++ {
 		blob, err := f.getBlobAt(ctx, i)
 		if err != nil {
@@ -165,20 +170,15 @@ func (f *openFile) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.R
 	return nil
 }
 
-func (f *file) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, resp *fuse.ListxattrResponse) error {
-	debug.Log("Listxattr(%v, %v)", f.node.Name, req.Size)
-	for _, attr := range f.node.ExtendedAttributes {
-		resp.Append(attr.Name)
-	}
+func (f *file) Listxattr(_ context.Context, req *fuse.ListxattrRequest, resp *fuse.ListxattrResponse) error {
+	nodeToXattrList(f.node, req, resp)
 	return nil
 }
 
-func (f *file) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) error {
-	debug.Log("Getxattr(%v, %v, %v)", f.node.Name, req.Name, req.Size)
-	attrval := f.node.GetExtendedAttribute(req.Name)
-	if attrval != nil {
-		resp.Xattr = attrval
-		return nil
-	}
-	return fuse.ErrNoXattr
+func (f *file) Getxattr(_ context.Context, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) error {
+	return nodeGetXattr(f.node, req, resp)
+}
+
+func (f *file) Forget() {
+	f.forget()
 }

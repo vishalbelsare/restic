@@ -18,19 +18,23 @@ Working with repositories
 Listing all snapshots
 =====================
 
-Now, you can list all the snapshots stored in the repository:
+Now, you can list all the snapshots stored in the repository. The size column
+only exists for snapshots created using restic 0.17.0 or later. It reflects the
+size of the contained files at the time when the snapshot was created. The
+directory of a snapshot may differ from the directory structure in the snapshot,
+see :ref:`absolute-and-relative-paths` for details.
 
 .. code-block:: console
 
     $ restic -r /srv/restic-repo snapshots
     enter password for repository:
-    ID        Date                 Host    Tags   Directory
-    ----------------------------------------------------------------------
-    40dc1520  2015-05-08 21:38:30  kasimir        /home/user/work
-    79766175  2015-05-08 21:40:19  kasimir        /home/user/work
-    bdbd3439  2015-05-08 21:45:17  luigi          /home/art
-    590c8fc8  2015-05-08 21:47:38  kazik          /srv
-    9f0bc19e  2015-05-08 21:46:11  luigi          /srv
+    ID        Date                 Host    Tags   Directory        Size
+    -------------------------------------------------------------------------
+    40dc1520  2015-05-08 21:38:30  kasimir        /home/user/work  20.643GiB
+    79766175  2015-05-08 21:40:19  kasimir        /home/user/work  20.645GiB
+    bdbd3439  2015-05-08 21:45:17  luigi          /home/art        3.141GiB
+    590c8fc8  2015-05-08 21:47:38  kazik          /srv             580.200MiB
+    9f0bc19e  2015-05-08 21:46:11  luigi          /srv             572.180MiB
 
 You can filter the listing by directory path:
 
@@ -38,10 +42,10 @@ You can filter the listing by directory path:
 
     $ restic -r /srv/restic-repo snapshots --path="/srv"
     enter password for repository:
-    ID        Date                 Host    Tags   Directory
-    ----------------------------------------------------------------------
-    590c8fc8  2015-05-08 21:47:38  kazik          /srv
-    9f0bc19e  2015-05-08 21:46:11  luigi          /srv
+    ID        Date                 Host    Tags   Directory  Size
+    -------------------------------------------------------------------
+    590c8fc8  2015-05-08 21:47:38  kazik          /srv       580.200MiB
+    9f0bc19e  2015-05-08 21:46:11  luigi          /srv       572.180MiB
 
 Or filter by host:
 
@@ -49,14 +53,14 @@ Or filter by host:
 
     $ restic -r /srv/restic-repo snapshots --host luigi
     enter password for repository:
-    ID        Date                 Host    Tags   Directory
-    ----------------------------------------------------------------------
-    bdbd3439  2015-05-08 21:45:17  luigi          /home/art
-    9f0bc19e  2015-05-08 21:46:11  luigi          /srv
+    ID        Date                 Host    Tags   Directory  Size
+    -------------------------------------------------------------------
+    bdbd3439  2015-05-08 21:45:17  luigi          /home/art  3.141GiB
+    9f0bc19e  2015-05-08 21:46:11  luigi          /srv       572.180MiB
 
 Combining filters is also possible.
 
-Furthermore you can group the output by the same filters (host, paths, tags):
+Furthermore, you can group the output by the same filters (host, paths, tags):
 
 .. code-block:: console
 
@@ -64,22 +68,135 @@ Furthermore you can group the output by the same filters (host, paths, tags):
 
     enter password for repository:
     snapshots for (host [kasimir])
-    ID        Date                 Host    Tags   Directory
-    ----------------------------------------------------------------------
-    40dc1520  2015-05-08 21:38:30  kasimir        /home/user/work
-    79766175  2015-05-08 21:40:19  kasimir        /home/user/work
+    ID        Date                 Host    Tags   Directory        Size
+    ------------------------------------------------------------------------
+    40dc1520  2015-05-08 21:38:30  kasimir        /home/user/work  20.643GiB
+    79766175  2015-05-08 21:40:19  kasimir        /home/user/work  20.645GiB
     2 snapshots
     snapshots for (host [luigi])
-    ID        Date                 Host    Tags   Directory
-    ----------------------------------------------------------------------
-    bdbd3439  2015-05-08 21:45:17  luigi          /home/art
-    9f0bc19e  2015-05-08 21:46:11  luigi          /srv
+    ID        Date                 Host    Tags   Directory  Size
+    -------------------------------------------------------------------
+    bdbd3439  2015-05-08 21:45:17  luigi          /home/art  3.141GiB
+    9f0bc19e  2015-05-08 21:46:11  luigi          /srv       572.180MiB
     2 snapshots
     snapshots for (host [kazik])
-    ID        Date                 Host    Tags   Directory
-    ----------------------------------------------------------------------
-    590c8fc8  2015-05-08 21:47:38  kazik          /srv
+    ID        Date                 Host    Tags   Directory  Size
+    -------------------------------------------------------------------
+    590c8fc8  2015-05-08 21:47:38  kazik          /srv       580.200MiB
     1 snapshots
+
+
+Listing files in a snapshot
+===========================
+
+To get a list of the files in a specific snapshot you can use the ``ls`` command:
+
+.. code-block:: console
+
+    $ restic ls 073a90db
+
+    snapshot 073a90db of [/home/user/work.txt] filtered by [] at 2024-01-21 16:51:18.474558607 +0100 CET:
+    /home
+    /home/user
+    /home/user/work.txt
+
+The special snapshot ID ``latest`` can be used to list files and directories of the latest snapshot in the repository.
+The ``--host`` flag can be used in conjunction to select the latest snapshot originating from a certain host only.
+
+.. code-block:: console
+
+    $ restic ls --host kasimir latest
+
+    snapshot 073a90db of [/home/user/work.txt] filtered by [] at 2024-01-21 16:51:18.474558607 +0100 CET:
+    /home
+    /home/user
+    /home/user/work.txt
+
+By default, ``ls`` prints all files in a snapshot.
+
+File listings can optionally be filtered by directories. Any positional arguments after the snapshot ID are interpreted
+as absolute directory paths, and only files inside those directories will be listed. Files in subdirectories are not
+listed when filtering by directories. If the ``--recursive`` flag is used, then subdirectories are also included.
+Any directory paths specified must be absolute (starting with a path separator); paths use the forward slash '/'
+as separator.
+
+.. code-block:: console
+
+    $ restic ls latest /home
+
+    snapshot 073a90db of [/home/user/work.txt] filtered by [/home] at 2024-01-21 16:51:18.474558607 +0100 CET:
+    /home
+    /home/user
+
+.. code-block:: console
+
+    $ restic ls --recursive latest /home
+
+    snapshot 073a90db of [/home/user/work.txt] filtered by [/home] at 2024-01-21 16:51:18.474558607 +0100 CET:
+    /home
+    /home/user
+    /home/user/work.txt
+
+To show more details about the files in a snapshot, you can use the ``--long`` option.  The columns include
+file permissions, UID, GID, file size, modification time and file path. For scripting usage, the
+``ls`` command supports the ``--json`` flag; the JSON output format is described at :ref:`ls json`.
+
+.. code-block:: console
+
+    $ restic ls --long latest
+
+    snapshot 073a90db of [/home/user/work.txt] filtered by [] at 2024-01-21 16:51:18.474558607 +0100 CET:
+    drwxr-xr-x     0     0      0 2024-01-21 16:50:52 /home
+    drwxr-xr-x     0     0      0 2024-01-21 16:51:03 /home/user
+    -rw-r--r--     0     0     18 2024-01-21 16:51:03 /home/user/work.txt
+
+NCDU (NCurses Disk Usage) is a tool to analyse disk usage of directories. The ``ls`` command supports
+outputting information about a snapshot in the NCDU format using the ``--ncdu`` option.
+
+You can use it as follows: ``restic ls latest --ncdu | ncdu -f -``
+
+You can use the options ``--sort`` and ``--reverse`` to tailor ``ls`` output to your needs.
+``--sort`` can be one of ``name | size | time=mtime | atime | ctime | extension``. The default
+sorting option is ``name``. The sorting order can be reversed by specifying ``--reverse``.
+
+.. code-block:: console
+
+    $ restic ls --long latest --sort size --reverse
+
+    snapshot 711b0bb6 of [/tmp/restic] at 2025-02-03 08:16:05.310764668 +0000 UTC filtered by []:
+    -rw-rw-r--  1000  1000  16772 2025-02-03 08:09:11 /tmp/restic/cmd_find.go
+    -rw-rw-r--  1000  1000   3077 2025-02-03 08:15:46 /tmp/restic/conf.py
+    -rw-rw-r--  1000  1000   2834 2025-02-03 08:09:35 /tmp/restic/find.go
+    -rw-rw-r--  1000  1000   1473 2025-02-03 08:15:30 /tmp/restic/010_introduction.rst
+    drwxrwxr-x  1000  1000      0 2025-02-03 08:15:46 /tmp/restic
+    dtrwxrwxrwx     0     0      0 2025-02-03 08:14:22 /tmp
+
+.. code-block:: console
+
+    $ restic ls --long latest --sort time
+
+    snapshot 711b0bb6 of [/tmp/restic] at 2025-02-03 08:16:05.310764668 +0000 UTC filtered by []:
+    -rw-rw-r--  1000  1000  16772 2025-02-03 08:09:11 /tmp/restic/cmd_find.go
+    -rw-rw-r--  1000  1000   2834 2025-02-03 08:09:35 /tmp/restic/find.go
+    dtrwxrwxrwx     0     0      0 2025-02-03 08:14:22 /tmp
+    -rw-rw-r--  1000  1000   1473 2025-02-03 08:15:30 /tmp/restic/010_introduction.rst
+    drwxrwxr-x  1000  1000      0 2025-02-03 08:15:46 /tmp/restic
+    -rw-rw-r--  1000  1000   3077 2025-02-03 08:15:46 /tmp/restic/conf.py
+
+Sorting works with option ``--json`` as well. Sorting and option ``--ncdu`` are mutually exclusive.
+It works also without specifying the option ``--long``.
+
+.. code-block:: console
+
+    $ restic ls latest --sort extension
+
+    snapshot 711b0bb6 of [/tmp/restic] at 2025-02-03 08:16:05.310764668 +0000 UTC filtered by []:
+    /tmp
+    /tmp/restic
+    /tmp/restic/cmd_find.go
+    /tmp/restic/find.go
+    /tmp/restic/conf.py
+    /tmp/restic/010_introduction.rst
 
 
 Copying snapshots between repositories
@@ -90,21 +207,33 @@ example from a local to a remote repository, you can use the ``copy`` command:
 
 .. code-block:: console
 
-    $ restic -r /srv/restic-repo copy --repo2 /srv/restic-repo-copy
-    repository d6504c63 opened successfully, password is correct
-    repository 3dd0878c opened successfully, password is correct
+    $ restic -r /srv/restic-repo-copy copy --from-repo /srv/restic-repo --verbose
+    repository d6504c63 opened successfully
+    repository 3dd0878c opened successfully
+    [0:00] 100.00%  2 / 2 index files loaded
+    [0:00] 100.00%  7 / 7 index files loaded
 
-    snapshot 410b18a2 of [/home/user/work] at 2020-06-09 23:15:57.305305 +0200 CEST)
+    snapshot 410b18a2 of [/home/user/work] at 2020-06-09 23:15:57.305305 +0200 CEST by user@kasimir
       copy started, this may take a while...
-    snapshot 7a746a07 saved
+    [0:00] 100.00%  13 / 13 packs copied
 
-    snapshot 4e5d5487 of [/home/user/work] at 2020-05-01 22:44:07.012113 +0200 CEST)
+    snapshot 4e5d5487 of [/home/user/work] at 2020-05-01 22:44:07.012113 +0200 CEST by user@kasimir
     skipping snapshot 4e5d5487, was already copied to snapshot 50eb62b7
+
+    snapshot 7a746a07 saved, copied from source snapshot 410b18a2
 
 The example command copies all snapshots from the source repository
 ``/srv/restic-repo`` to the destination repository ``/srv/restic-repo-copy``.
+The destination repository must already exist; when creating it for the first
+time, use ``init --from-repo`` with ``--copy-chunker-params`` as described in
+:ref:`copy-deduplication` below so that deduplication works across both
+repositories.
+
 Snapshots which have previously been copied between repositories will
-be skipped by later copy runs.
+be skipped by later copy runs. Information about skipped snapshots is only
+printed when ``--verbose`` is passed to the command. For efficiency reasons,
+the snapshots are copied in batches, such that the ``snapshot [...] saved``
+messages can appear some time after the snapshot content was copied.
 
 .. important:: This process will have to both download (read) and upload (write)
     the entire snapshot(s) due to the different encryption keys used in the
@@ -117,17 +246,17 @@ be skipped by later copy runs.
     both the source and destination repository, *may occupy up to twice their
     space* in the destination repository. See below for how to avoid this.
 
-The destination repository is specified with ``--repo2`` or can be read 
-from a file specified via ``--repository-file2``. Both of these options
-can also set as environment variables ``$RESTIC_REPOSITORY2`` or
-``$RESTIC_REPOSITORY_FILE2`` respectively. For the destination repository 
-the password can be read from a file ``--password-file2`` or from a command 
-``--password-command2``.
-Alternatively the environment variables ``$RESTIC_PASSWORD_COMMAND2`` and
-``$RESTIC_PASSWORD_FILE2`` can be used. It is also possible to directly
-pass the password via ``$RESTIC_PASSWORD2``. The key which should be used
-for decryption can be selected by passing its ID via the flag ``--key-hint2``
-or the environment variable ``$RESTIC_KEY_HINT2``.
+The source repository is specified with ``--from-repo`` or can be read
+from a file specified via ``--from-repository-file``. Both of these options
+can also be set as environment variables ``$RESTIC_FROM_REPOSITORY`` or
+``$RESTIC_FROM_REPOSITORY_FILE``, respectively. For the source repository
+the password can be read from a file ``--from-password-file`` or from a command
+``--from-password-command``.
+Alternatively the environment variables ``$RESTIC_FROM_PASSWORD_COMMAND`` and
+``$RESTIC_FROM_PASSWORD_FILE`` can be used. You can also directly
+pass the password via ``$RESTIC_FROM_PASSWORD``. The key which should be used
+for decryption can be selected by passing its ID via the flag ``--from-key-hint``
+or the environment variable ``$RESTIC_FROM_KEY_HINT``.
 
 .. note:: In case the source and destination repository use the same backend,
     the configuration options and environment variables used to configure the
@@ -136,22 +265,28 @@ or the environment variable ``$RESTIC_KEY_HINT2``.
     repository. You can avoid this limitation by using the rclone backend
     along with remotes which are configured in rclone.
 
+.. note:: If ``copy`` is aborted, ``copy`` will resume the interrupted copying when it is run again. It's possible that up to 10 minutes of progress can be lost because the repository index is only updated from time to time.
+
+.. _copy-filtering-snapshots:
+
 Filtering snapshots to copy
 ---------------------------
 
 The list of snapshots to copy can be filtered by host, path in the backup
-and / or a comma-separated tag list:
+and/or a comma-separated tag list:
 
 .. code-block:: console
 
-    $ restic -r /srv/restic-repo copy --repo2 /srv/restic-repo-copy --host luigi --path /srv --tag foo,bar
+    $ restic -r /srv/restic-repo-copy copy --from-repo /srv/restic-repo --host luigi --path /srv --tag foo,bar
 
-It is also possible to explicitly specify the list of snapshots to copy, in
+You can also explicitly specify the list of snapshots to copy, in
 which case only these instead of all snapshots will be copied:
 
 .. code-block:: console
 
-    $ restic -r /srv/restic-repo copy --repo2 /srv/restic-repo-copy 410b18a2 4e5d5487 latest
+    $ restic -r /srv/restic-repo-copy copy --from-repo /srv/restic-repo 410b18a2 4e5d5487 latest
+
+.. _copy-deduplication:
 
 Ensuring deduplication for copied snapshots
 -------------------------------------------
@@ -165,15 +300,112 @@ identical chunks and therefore deduplication also works for snapshots copied bet
 these repositories.
 
 The chunker parameters are generated once when creating a new (destination) repository.
-That is for a copy destination repository we have to instruct restic to initialize it
+For a copy destination repository, you must instruct restic to initialize it
 using the same chunker parameters as the source repository:
 
 .. code-block:: console
 
-    $ restic -r /srv/restic-repo-copy init --repo2 /srv/restic-repo --copy-chunker-params
+    $ restic -r /srv/restic-repo-copy init --from-repo /srv/restic-repo --copy-chunker-params
 
 Note that it is not possible to change the chunker parameters of an existing repository.
 
+
+Removing files from snapshots
+=============================
+
+Snapshots sometimes turn out to include more files than intended. Instead of
+removing the snapshots entirely and running the corresponding backup commands
+again (which is not always practical after the fact), you can remove
+the unwanted files from affected snapshots by rewriting them using the
+``rewrite`` command:
+
+.. code-block:: console
+
+    $ restic -r /srv/restic-repo rewrite --exclude secret-file
+    repository c881945a opened (repository version 2) successfully
+
+    snapshot 6160ddb2 of [/home/user/work] at 2022-06-12 16:01:28.406630608 +0200 CEST by user@kasimir
+    excluding /home/user/work/secret-file
+    saved new snapshot b6aee1ff
+
+    snapshot 4fbaf325 of [/home/user/work] at 2022-05-01 11:22:26.500093107 +0200 CEST by user@kasimir
+
+    modified 1 snapshots
+
+    $ restic -r /srv/restic-repo rewrite --exclude secret-file 6160ddb2
+    repository c881945a opened (repository version 2) successfully
+
+    snapshot 6160ddb2 of [/home/user/work] at 2022-06-12 16:01:28.406630608 +0200 CEST by user@kasimir
+    excluding /home/user/work/secret-file
+    new snapshot saved as b6aee1ff
+
+    modified 1 snapshots
+
+The options ``--exclude``, ``--exclude-file``, ``--iexclude`` and
+``--iexclude-file`` are supported. They behave the same way as for the backup
+command, see :ref:`backup-excluding-files` for details.
+
+The options ``--include``, ``--include-file``, ``--iinclude`` and
+``--iinclude-file`` are supported as well.
+The ``--include`` variants allow you to reduce an existing snapshot or a set of snapshots
+to those files that you are really interested in. An example could be all pictures
+from a snapshot:
+``restic rewrite -r ... --iinclude "*.jpg" --iinclude "*.jpeg" --iinclude "*.png"``.
+
+You can rewrite only a subset of snapshots by filtering them the same
+way as for the ``copy`` command, see :ref:`copy-filtering-snapshots`.
+
+The option ``--snapshot-summary`` can be used to attach summary data to existing
+snapshots that do not have this information. When a snapshot summary is created
+the only fields added are ``TotalFilesProcessed`` and ``TotalBytesProcessed``.
+
+By default, the ``rewrite`` command will keep the original snapshots and create
+new ones for every snapshot which was modified during rewriting. The new
+snapshots are marked with the tag ``rewrite`` to distinguish them from the
+original, untouched snapshots.
+
+Alternatively, you can use the ``--forget`` option to immediately remove the
+original snapshots. In this case, no tag is added to the new snapshots. Please
+note that this only removes the snapshots and not the actual data stored in the
+repository. Run the ``prune`` command afterwards to remove the now unreferenced
+data (just like when having used the ``forget`` command).
+
+In order to preview the changes which ``rewrite`` would make, you can use the
+``--dry-run`` option. This will simulate the rewriting process without actually
+modifying the repository. Instead restic will only print the actions it would
+perform.
+
+.. note:: The ``rewrite`` command verifies that it does not modify snapshots in
+    unexpected ways and otherwise fails with the error ``cannot encode tree at "[...]" without losing information``.
+    This can occur when rewriting a snapshot created by a newer
+    version of restic or some third-party implementation.
+
+    To convert a snapshot into the format expected by the ``rewrite`` command
+    use ``restic -r /srv/restic-repo repair snapshots <snapshotID>``.
+
+Modifying metadata of snapshots
+===============================
+
+Sometimes it may be desirable to change the metadata of an existing snapshot.
+Currently, rewriting the hostname and the time of the backup is supported.
+This is possible using the ``rewrite`` command with the option ``--new-host`` followed by the desired new hostname or the option ``--new-time`` followed by the desired new timestamp.
+
+.. code-block:: console
+
+    $ restic -r /srv/restic-repo rewrite --new-host newhost --new-time "1999-01-01 11:11:11"
+
+    repository b7dbade3 opened (version 2, compression level auto)
+    [0:00] 100.00%  1 / 1 index files loaded
+
+    snapshot 8ed674f4 of [/path/to/abc.txt] at 2023-11-27 21:57:52.439139291 +0100 CET by user@kasimir
+    setting time to 1999-01-01 11:11:11 +0100 CET
+    setting host to newhost
+    saved new snapshot c05da643
+
+    modified 1 snapshots
+
+
+.. _checking-integrity:
 
 Checking integrity and consistency
 ==================================
@@ -213,19 +445,39 @@ detect this and yield the same error as when you tried to restore:
     $ restic -r /srv/restic-repo check
     ...
     load indexes
-    error: error loading index de30f323: load <index/de30f3231c>: invalid data returned
-    Fatal: LoadIndex returned errors
+    error: error loading index de30f3231ca2e6a59af4aa84216dfe2ef7339c549dc11b09b84000997b139628: LoadRaw(<index/de30f3231c>): invalid data returned
 
-If the repository structure is intact, restic will show that no errors were found:
+    The repository index is damaged and must be repaired. You must run ``restic repair index`` to correct this.
+
+    Fatal: repository contains errors
+
+.. warning::
+
+    If ``check`` reports an error in the repository, then you must repair the repository.
+    As long as a repository is damaged, restoring some files or directories will fail. New
+    snapshots are not guaranteed to be restorable either.
+
+    For instructions how to repair a damaged repository, see the :ref:`troubleshooting`
+    section or follow the instructions provided by the ``check`` command.
+
+If the repository structure is intact, restic will show that ``no errors were found``:
 
 .. code-block:: console
 
-    $ restic -r /src/restic-repo check
+    $ restic -r /srv/restic-repo check
     ...
     load indexes
     check all packs
     check snapshots, trees and blobs
     no errors were found
+
+By default, check creates a new temporary cache directory to verify that the
+data stored in the repository is intact. To reuse the existing cache, you can
+use the ``--with-cache`` flag.
+
+If the cache directory is not explicitly set, then ``check`` creates its
+temporary cache directory in the temporary directory, see :ref:`temporary_files`.
+Otherwise, the specified cache directory is used, as described in :ref:`caching`.
 
 By default, the ``check`` command does not verify that the actual pack files
 on disk in the repository are unmodified, because doing so requires reading
@@ -248,12 +500,12 @@ integrity of the pack files in the repository, use the ``--read-data`` flag:
     repository, beware that it might incur higher bandwidth costs than usual
     and also that it takes more time than the default ``check``.
 
-Alternatively, use the ``--read-data-subset`` parameter to check only a
-subset of the repository pack files at a time. It supports three ways to select a
-subset. One selects a specific range of pack files, the second selects a random
-percentage of pack files, and the third selects pack files of the specified size.
+Alternatively, use the ``--read-data-subset`` parameter to check only a subset
+of the repository pack files at a time. It supports three ways to select a
+subset. One selects a specific part of pack files, the second and third
+selects a random subset of the pack files by the given percentage or size.
 
-Use ``--read-data-subset=n/t`` to check only a subset of the repository pack
+Use ``--read-data-subset=n/t`` to check a specific part of the repository pack
 files at a time. The parameter takes two values, ``n`` and ``t``. When the check
 command runs, all pack files in the repository are logically divided in ``t``
 (roughly equal) groups, and only files that belong to group number ``n`` are
@@ -268,33 +520,131 @@ over 5 separate invocations:
     $ restic -r /srv/restic-repo check --read-data-subset=4/5
     $ restic -r /srv/restic-repo check --read-data-subset=5/5
 
-Use ``--read-data-subset=n%`` to check a randomly choosen subset of the
-repository pack files. It takes one parameter, ``n``, the percentage of pack
-files to check as an integer or floating point number. This will not guarantee
-to cover all available pack files after sufficient runs, but it is easy to
-automate checking a small subset of data after each backup. For a floating point
-value the following command may be used:
+Use ``--read-data-subset=x%`` to check a randomly chosen subset of the
+repository pack files. It takes one parameter, ``x``, the percentage of
+pack files to check as an integer or floating point number. This will not
+guarantee to cover all available pack files after sufficient runs, but it is
+easy to automate checking a small subset of data after each backup. For a
+floating point value the following command may be used:
 
 .. code-block:: console
 
     $ restic -r /srv/restic-repo check --read-data-subset=2.5%
 
-When checking bigger subsets you most likely specify the percentage as an
-integer:
+When checking bigger subsets you most likely want to specify the percentage
+as an integer:
 
 .. code-block:: console
 
     $ restic -r /srv/restic-repo check --read-data-subset=10%
 
-Use ``--read-data-subset=NS`` to check a randomly chosen subset of the repository pack files. 
-It takes one parameter, ``NS``, where 'N' is a whole number representing file size and 'S' is the unit 
-of file size (B/K/M/G/T) of pack files to check. Behind the scenes, the specified size will be converted 
-to percentage of the total repository size. The behaviour of the check command following this conversion 
-will be the same as the percentage option above. For a file size value the following command may be used:
+Use ``--read-data-subset=nS`` to check a randomly chosen subset of the
+repository pack files. It takes one parameter, ``nS``, where 'n' is a whole
+number representing file size and 'S' is the unit of file size (K/M/G/T) of
+pack files to check. Behind the scenes, the specified size will be converted
+to percentage of the total repository size. The behaviour of the check command
+following this conversion will be the same as the percentage option above. For
+a file size value the following command may be used:
 
 .. code-block:: console
 
     $ restic -r /srv/restic-repo check --read-data-subset=50M
     $ restic -r /srv/restic-repo check --read-data-subset=10G
 
+Finding things in the repository
+================================
 
+The ``restic find`` command searches for files or directories stored
+in the repository.
+
+Finding files and directories
+-----------------------------
+
+If you want to find files or directories in the repository, you either specify filename(s)
+or a pattern which represents filename(s).
+The use of file patterns is described in :ref:`backup-excluding-files`.
+Here is an example:
+
+.. code-block:: console
+
+    $ restic -r /srv/restic-repo find "0/**/7"
+    Found matching entries in snapshot 774ebacd from 2026-01-16 09:01:17
+    /srv/restic-repo/restic/testdata/0/0/9/7
+
+.. warning::
+
+    All positional parameters for ``restic find`` are used as patterns. Quote names with
+    spaces, such as ``"file one.bar"``. If in doubt, use a quoted wildcard like ``"*.txt"``.
+
+If you know that a particular file pattern is located in a specific snapshot or a
+set of snapshots, you can limit the search using the ``--snapshot`` option (may be repeated):
+
+.. code-block:: console
+
+    $ restic -r /srv/restic-repo find --snapshot latest file1.txt
+    Found matching entries in snapshot caffee11 from 2026-01-16 09:01:17
+    /srv/restic-repo/restic/testdata/0/for_cmd_ls/file1.txt
+
+.. note::
+
+    Without ``--snapshot``, ``find`` searches all snapshots. You can narrow your search
+    using the standard filter options ``--host``, ``--path`` and ``--tag``.
+
+Another interesting feature of the ``find`` command is the ability to search for
+files and directories which have an ``inode`` modification time in a given
+time interval, by using the options ``--oldest`` and ``--newest``.
+You don't have to give both the options, a half open interval is perfectly acceptable.
+The following example searches for files which have a modification date in the year 2025.
+
+.. code-block:: console
+
+    $ restic -r /srv/restic-repo find --oldest 2025-01-01 --newest "2025-12-31 23:59:59" "*.txt"
+    Found matching entries in snapshot dd90f84d from 2026-01-17 17:26:41
+    /srv/restic-repo/restic/testdata/0/for_cmd_ls/file1.txt
+    /srv/restic-repo/restic/testdata/0/for_cmd_ls/file2.txt
+
+All these commands work in ``--json`` mode as well, for output details for the
+various options please refer to :ref:`find`.
+
+Finding blobs, trees, or packfiles
+----------------------------------
+
+The other options of the ``find`` command are devoted to finding blobs, trees and packfiles.
+These are typically not used by the normal user, but can help debugging a problem
+with restic. See :ref:`troubleshooting` for a more automated way to repair repositories.
+
+Just one quick example: if you are looking for specific data blob(s), you can issue the command:
+
+.. code-block:: console
+
+    $ restic -r /srv/restic-repo find --blob fcd9ec0c
+    Found blob fcd9ec0c99f7992c184666e3040831b919f3375157bd563a2b65cde1c6789847
+     ... in file /srv/restic-repo/restic/testdata/0/0/9/60
+         (tree 6409bed28d08898b849ecc4fdf338cdb0d67358619c99e6f6c3b402b1895baf8)
+     ... in snapshot 774ebacd (2026-01-16 09:01:17)
+
+
+Upgrading the repository format version
+=======================================
+
+Repositories created using earlier restic versions use an older repository
+format version and have to be upgraded to allow using all new features.
+Upgrading must be done explicitly as a newer repository version increases the
+minimum restic version required to access the repository. For example the
+repository format version 2 is only readable using restic 0.14.0 or newer.
+
+Upgrading to repository version 2 is a two step process: first run
+``migrate upgrade_repo_v2`` which will check the repository integrity and
+then upgrade the repository version. Repository problems must be corrected
+before the migration will be possible. After the migration is complete, run
+``prune`` to compress the repository metadata. To limit the amount of data
+rewritten at once, you can use the ``prune --max-repack-size size``
+parameter, see :ref:`customize-pruning` for more details.
+
+File contents stored in the repository will not be rewritten, data from new
+backups will be compressed. Over time more and more of the repository will
+be compressed. To speed up this process and compress all not yet compressed
+data, you can run ``prune --repack-uncompressed``. When you plan to create
+your backups with maximum compression, you should also add the
+``--compression max`` flag to the prune command. For already backed up data,
+the compression level cannot be changed later on.

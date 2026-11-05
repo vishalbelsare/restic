@@ -4,23 +4,24 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/restic/restic/internal/backend"
+	"github.com/restic/restic/internal/backend/location"
 	"github.com/restic/restic/internal/backend/s3"
 	"github.com/restic/restic/internal/backend/test"
-	"github.com/restic/restic/internal/restic"
+	"github.com/restic/restic/internal/options"
 	rtest "github.com/restic/restic/internal/test"
 )
+
+const seaweedFSS3Addr = "127.0.0.1:8333"
 
 func mkdir(t testing.TB, dir string) {
 	err := os.MkdirAll(dir, 0700)
@@ -29,18 +30,24 @@ func mkdir(t testing.TB, dir string) {
 	}
 }
 
-func runMinio(ctx context.Context, t testing.TB, dir, key, secret string) func() {
-	mkdir(t, filepath.Join(dir, "config"))
-	mkdir(t, filepath.Join(dir, "root"))
+func runSeaweedFS(ctx context.Context, t testing.TB, dir, key, secret string) func() {
+	mkdir(t, dir)
 
-	cmd := exec.CommandContext(ctx, "minio",
-		"server",
-		"--address", "127.0.0.1:9000",
-		"--config-dir", filepath.Join(dir, "config"),
-		filepath.Join(dir, "root"))
+	cmd := exec.CommandContext(ctx, "weed",
+		"mini",
+		"-dir", dir,
+		"-ip", "127.0.0.1",
+		"-ip.bind", "127.0.0.1",
+		"-s3.port", "8333",
+		"-s3.port.iceberg", "0",
+		"-s3.port.lance", "0",
+		"-webdav=false",
+		"-admin.ui=false",
+		"-master.telemetry=false",
+	)
 	cmd.Env = append(os.Environ(),
-		"MINIO_ACCESS_KEY="+key,
-		"MINIO_SECRET_KEY="+secret,
+		"AWS_ACCESS_KEY_ID="+key,
+		"AWS_SECRET_ACCESS_KEY="+secret,
 	)
 	cmd.Stderr = os.Stderr
 
@@ -49,12 +56,12 @@ func runMinio(ctx context.Context, t testing.TB, dir, key, secret string) func()
 		t.Fatal(err)
 	}
 
-	// wait until the TCP port is reachable
+	// wait until the S3 TCP port is reachable
 	var success bool
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		time.Sleep(200 * time.Millisecond)
 
-		c, err := net.Dial("tcp", "localhost:9000")
+		c, err := net.Dial("tcp", seaweedFSS3Addr)
 		if err == nil {
 			success = true
 			if err := c.Close(); err != nil {
@@ -65,7 +72,7 @@ func runMinio(ctx context.Context, t testing.TB, dir, key, secret string) func()
 	}
 
 	if !success {
-		t.Fatal("unable to connect to minio server")
+		t.Fatal("unable to connect to seaweedfs s3 endpoint")
 		return nil
 	}
 
@@ -97,191 +104,97 @@ func newRandomCredentials(t testing.TB) (key, secret string) {
 	return key, secret
 }
 
-type MinioTestConfig struct {
-	s3.Config
+func newSeaweedFSTestSuite(t testing.TB) (*test.Suite[s3.Config], func()) {
+	ctx, cancel := context.WithCancel(context.Background())
 
-	tempdir       string
-	removeTempdir func()
-	stopServer    func()
-}
+	tempdir := rtest.TempDir(t)
+	key, secret := newRandomCredentials(t)
+	cleanup := runSeaweedFS(ctx, t, tempdir, key, secret)
 
-func createS3(t testing.TB, cfg MinioTestConfig, tr http.RoundTripper) (be restic.Backend, err error) {
-	for i := 0; i < 10; i++ {
-		be, err = s3.Create(context.TODO(), cfg.Config, tr)
-		if err != nil {
-			t.Logf("s3 open: try %d: error %v", i, err)
-			time.Sleep(500 * time.Millisecond)
-			continue
-		}
-
-		break
-	}
-
-	return be, err
-}
-
-func newMinioTestSuite(ctx context.Context, t testing.TB) *test.Suite {
-	tr, err := backend.Transport(backend.TransportOptions{})
-	if err != nil {
-		t.Fatalf("cannot create transport for tests: %v", err)
-	}
-
-	return &test.Suite{
+	return &test.Suite[s3.Config]{
 		// NewConfig returns a config for a new temporary backend that will be used in tests.
-		NewConfig: func() (interface{}, error) {
-			cfg := MinioTestConfig{}
-
-			cfg.tempdir, cfg.removeTempdir = rtest.TempDir(t)
-			key, secret := newRandomCredentials(t)
-			cfg.stopServer = runMinio(ctx, t, cfg.tempdir, key, secret)
-
-			cfg.Config = s3.NewConfig()
-			cfg.Config.Endpoint = "localhost:9000"
-			cfg.Config.Bucket = "restictestbucket"
-			cfg.Config.Prefix = fmt.Sprintf("test-%d", time.Now().UnixNano())
-			cfg.Config.UseHTTP = true
-			cfg.Config.KeyID = key
-			cfg.Config.Secret = secret
-			return cfg, nil
+		NewConfig: func() (*s3.Config, error) {
+			cfg := s3.NewConfig()
+			cfg.Endpoint = seaweedFSS3Addr
+			cfg.Bucket = "restictestbucket"
+			cfg.Prefix = fmt.Sprintf("test-%d", time.Now().UnixNano())
+			cfg.UseHTTP = true
+			cfg.Region = "us-east-1"
+			cfg.BucketLookup = "path"
+			cfg.KeyID = key
+			cfg.Secret = options.NewSecretString(secret)
+			return &cfg, nil
 		},
 
-		// CreateFn is a function that creates a temporary repository for the tests.
-		Create: func(config interface{}) (restic.Backend, error) {
-			cfg := config.(MinioTestConfig)
-
-			be, err := createS3(t, cfg, tr)
-			if err != nil {
-				return nil, err
+		Factory: location.NewHTTPBackendFactory("s3", s3.ParseConfig, location.NoPassword, func(ctx context.Context, cfg s3.Config, rt http.RoundTripper, errorLog func(string, ...any)) (be backend.Backend, err error) {
+			for i := range 50 {
+				be, err = s3.Create(ctx, cfg, rt, errorLog)
+				if err != nil {
+					t.Logf("s3 open: try %d: error %v", i, err)
+					time.Sleep(500 * time.Millisecond)
+					continue
+				}
+				break
 			}
-
-			exists, err := be.Test(ctx, restic.Handle{Type: restic.ConfigFile})
-			if err != nil {
-				return nil, err
-			}
-
-			if exists {
-				return nil, errors.New("config already exists")
-			}
-
-			return be, nil
-		},
-
-		// OpenFn is a function that opens a previously created temporary repository.
-		Open: func(config interface{}) (restic.Backend, error) {
-			cfg := config.(MinioTestConfig)
-			return s3.Open(ctx, cfg.Config, tr)
-		},
-
-		// CleanupFn removes data created during the tests.
-		Cleanup: func(config interface{}) error {
-			cfg := config.(MinioTestConfig)
-			if cfg.stopServer != nil {
-				cfg.stopServer()
-			}
-			if cfg.removeTempdir != nil {
-				cfg.removeTempdir()
-			}
-			return nil
-		},
+			return be, err
+		}, s3.Open),
+	}, func() {
+		defer cancel()
+		defer cleanup()
 	}
 }
 
-func TestBackendMinio(t *testing.T) {
+func TestBackendSeaweedFS(t *testing.T) {
 	defer func() {
 		if t.Skipped() {
-			rtest.SkipDisallowed(t, "restic/backend/s3.TestBackendMinio")
+			rtest.SkipDisallowed(t, "restic/backend/s3.TestBackendSeaweedFS")
 		}
 	}()
 
-	// try to find a minio binary
-	_, err := exec.LookPath("minio")
+	_, err := exec.LookPath("weed")
 	if err != nil {
 		t.Skip(err)
 		return
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	suite, cleanup := newSeaweedFSTestSuite(t)
+	defer cleanup()
 
-	newMinioTestSuite(ctx, t).RunTests(t)
+	suite.RunTests(t)
 }
 
-func BenchmarkBackendMinio(t *testing.B) {
-	// try to find a minio binary
-	_, err := exec.LookPath("minio")
+func BenchmarkBackendSeaweedFS(t *testing.B) {
+	_, err := exec.LookPath("weed")
 	if err != nil {
 		t.Skip(err)
 		return
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	suite, cleanup := newSeaweedFSTestSuite(t)
+	defer cleanup()
 
-	newMinioTestSuite(ctx, t).RunBenchmarks(t)
+	suite.RunBenchmarks(t)
 }
 
-func newS3TestSuite(t testing.TB) *test.Suite {
-	tr, err := backend.Transport(backend.TransportOptions{})
-	if err != nil {
-		t.Fatalf("cannot create transport for tests: %v", err)
-	}
-
-	return &test.Suite{
+func newS3TestSuite() *test.Suite[s3.Config] {
+	return &test.Suite[s3.Config]{
 		// do not use excessive data
 		MinimalData: true,
 
 		// NewConfig returns a config for a new temporary backend that will be used in tests.
-		NewConfig: func() (interface{}, error) {
-			s3cfg, err := s3.ParseConfig(os.Getenv("RESTIC_TEST_S3_REPOSITORY"))
+		NewConfig: func() (*s3.Config, error) {
+			cfg, err := s3.ParseConfig(os.Getenv("RESTIC_TEST_S3_REPOSITORY"))
 			if err != nil {
 				return nil, err
 			}
 
-			cfg := s3cfg.(s3.Config)
 			cfg.KeyID = os.Getenv("RESTIC_TEST_S3_KEY")
-			cfg.Secret = os.Getenv("RESTIC_TEST_S3_SECRET")
+			cfg.Secret = options.NewSecretString(os.Getenv("RESTIC_TEST_S3_SECRET"))
 			cfg.Prefix = fmt.Sprintf("test-%d", time.Now().UnixNano())
 			return cfg, nil
 		},
 
-		// CreateFn is a function that creates a temporary repository for the tests.
-		Create: func(config interface{}) (restic.Backend, error) {
-			cfg := config.(s3.Config)
-
-			be, err := s3.Create(context.TODO(), cfg, tr)
-			if err != nil {
-				return nil, err
-			}
-
-			exists, err := be.Test(context.TODO(), restic.Handle{Type: restic.ConfigFile})
-			if err != nil {
-				return nil, err
-			}
-
-			if exists {
-				return nil, errors.New("config already exists")
-			}
-
-			return be, nil
-		},
-
-		// OpenFn is a function that opens a previously created temporary repository.
-		Open: func(config interface{}) (restic.Backend, error) {
-			cfg := config.(s3.Config)
-			return s3.Open(context.TODO(), cfg, tr)
-		},
-
-		// CleanupFn removes data created during the tests.
-		Cleanup: func(config interface{}) error {
-			cfg := config.(s3.Config)
-
-			be, err := s3.Open(context.TODO(), cfg, tr)
-			if err != nil {
-				return err
-			}
-
-			return be.Delete(context.TODO())
-		},
+		Factory: s3.NewFactory(),
 	}
 }
 
@@ -306,7 +219,7 @@ func TestBackendS3(t *testing.T) {
 	}
 
 	t.Logf("run tests")
-	newS3TestSuite(t).RunTests(t)
+	newS3TestSuite().RunTests(t)
 }
 
 func BenchmarkBackendS3(t *testing.B) {
@@ -324,5 +237,5 @@ func BenchmarkBackendS3(t *testing.B) {
 	}
 
 	t.Logf("run tests")
-	newS3TestSuite(t).RunBenchmarks(t)
+	newS3TestSuite().RunBenchmarks(t)
 }

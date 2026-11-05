@@ -6,9 +6,10 @@ import (
 	"path"
 
 	"github.com/restic/restic/internal/bloblru"
-	"github.com/restic/restic/internal/errors"
+	"github.com/restic/restic/internal/data"
 	"github.com/restic/restic/internal/restic"
 	"github.com/restic/restic/internal/walker"
+	"golang.org/x/sync/errgroup"
 )
 
 // A Dumper writes trees and files from a repository to a Writer
@@ -16,11 +17,11 @@ import (
 type Dumper struct {
 	cache  *bloblru.Cache
 	format string
-	repo   restic.Repository
+	repo   restic.Loader
 	w      io.Writer
 }
 
-func New(format string, repo restic.Repository, w io.Writer) *Dumper {
+func New(format string, repo restic.Loader, w io.Writer) *Dumper {
 	return &Dumper{
 		cache:  bloblru.New(64 << 20),
 		format: format,
@@ -29,36 +30,45 @@ func New(format string, repo restic.Repository, w io.Writer) *Dumper {
 	}
 }
 
-func (d *Dumper) DumpTree(ctx context.Context, tree *restic.Tree, rootPath string) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+func (d *Dumper) DumpTree(ctx context.Context, tree data.TreeNodeIterator, rootPath string) error {
+	wg, ctx := errgroup.WithContext(ctx)
 
 	// ch is buffered to deal with variable download/write speeds.
-	ch := make(chan *restic.Node, 10)
-	go sendTrees(ctx, d.repo, tree, rootPath, ch)
+	ch := make(chan *data.Node, 10)
+	wg.Go(func() error {
+		return sendTrees(ctx, d.repo, tree, rootPath, ch)
+	})
 
-	switch d.format {
-	case "tar":
-		return d.dumpTar(ctx, ch)
-	case "zip":
-		return d.dumpZip(ctx, ch)
-	default:
-		panic("unknown dump format")
-	}
+	wg.Go(func() error {
+		switch d.format {
+		case "tar":
+			return d.dumpTar(ctx, ch)
+		case "zip":
+			return d.dumpZip(ctx, ch)
+		default:
+			panic("unknown dump format")
+		}
+	})
+	return wg.Wait()
 }
 
-func sendTrees(ctx context.Context, repo restic.Repository, tree *restic.Tree, rootPath string, ch chan *restic.Node) {
+func sendTrees(ctx context.Context, repo restic.BlobLoader, nodes data.TreeNodeIterator, rootPath string, ch chan *data.Node) error {
 	defer close(ch)
 
-	for _, root := range tree.Nodes {
-		root.Path = path.Join(rootPath, root.Name)
-		if sendNodes(ctx, repo, root, ch) != nil {
-			break
+	for item := range nodes {
+		if item.Error != nil {
+			return item.Error
+		}
+		node := item.Node
+		node.Path = path.Join(rootPath, node.Name)
+		if err := sendNodes(ctx, repo, node, ch); err != nil {
+			return err
 		}
 	}
+	return nil
 }
 
-func sendNodes(ctx context.Context, repo restic.Repository, root *restic.Node, ch chan *restic.Node) error {
+func sendNodes(ctx context.Context, repo restic.BlobLoader, root *data.Node, ch chan *data.Node) error {
 	select {
 	case ch <- root:
 	case <-ctx.Done():
@@ -66,77 +76,88 @@ func sendNodes(ctx context.Context, repo restic.Repository, root *restic.Node, c
 	}
 
 	// If this is no directory we are finished
-	if !IsDir(root) {
+	if root.Type != data.NodeTypeDir {
 		return nil
 	}
 
-	err := walker.Walk(ctx, repo, *root.Subtree, nil, func(_ restic.ID, nodepath string, node *restic.Node, err error) (bool, error) {
+	err := walker.Walk(ctx, repo, *root.Subtree, walker.WalkVisitor{ProcessNode: func(_ restic.ID, nodepath string, node *data.Node, err error) error {
 		if err != nil {
-			return false, err
+			return err
 		}
 		if node == nil {
-			return false, nil
+			return nil
 		}
 
 		node.Path = path.Join(root.Path, nodepath)
 
-		if !IsFile(node) && !IsDir(node) && !IsLink(node) {
-			return false, nil
+		if node.Type != data.NodeTypeFile && node.Type != data.NodeTypeDir && node.Type != data.NodeTypeSymlink {
+			return nil
 		}
 
 		select {
 		case ch <- node:
 		case <-ctx.Done():
-			return false, ctx.Err()
+			return ctx.Err()
 		}
 
-		return false, nil
-	})
+		return nil
+	}})
 
 	return err
 }
 
 // WriteNode writes a file node's contents directly to d's Writer,
 // without caring about d's format.
-func (d *Dumper) WriteNode(ctx context.Context, node *restic.Node) error {
+func (d *Dumper) WriteNode(ctx context.Context, node *data.Node) error {
 	return d.writeNode(ctx, d.w, node)
 }
 
-func (d *Dumper) writeNode(ctx context.Context, w io.Writer, node *restic.Node) error {
-	var (
-		buf []byte
-		err error
-	)
-	for _, id := range node.Content {
-		blob, ok := d.cache.Get(id)
-		if !ok {
-			blob, err = d.repo.LoadBlob(ctx, restic.DataBlob, id, buf)
-			if err != nil {
-				return err
+func (d *Dumper) writeNode(ctx context.Context, w io.Writer, node *data.Node) error {
+	wg, ctx := errgroup.WithContext(ctx)
+	limit := int(d.repo.Connections())
+	wg.SetLimit(1 + limit) // +1 for the writer.
+	blobs := make(chan (<-chan []byte), limit)
+
+	// Writer.
+	wg.Go(func() error {
+		for ch := range blobs {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case blob := <-ch:
+				if _, err := w.Write(blob); err != nil {
+					return err
+				}
 			}
-
-			buf = d.cache.Add(id, blob) // Reuse evicted buffer.
 		}
+		return nil
+	})
 
-		if _, err := w.Write(blob); err != nil {
-			return errors.Wrap(err, "Write")
+	// Start short-lived goroutines to load blobs.
+loop:
+	for _, id := range node.Content {
+		// This needs to be buffered, so that loaders can quit
+		// without waiting for the writer.
+		ch := make(chan []byte, 1)
+
+		wg.Go(func() error {
+			blob, err := d.cache.GetOrCompute(id, func() ([]byte, error) {
+				return d.repo.LoadBlob(ctx, restic.BlobHandle{Type: restic.DataBlob, ID: id}, nil)
+			})
+
+			if err == nil {
+				ch <- blob
+			}
+			return err
+		})
+
+		select {
+		case blobs <- ch:
+		case <-ctx.Done():
+			break loop
 		}
 	}
 
-	return nil
-}
-
-// IsDir checks if the given node is a directory.
-func IsDir(node *restic.Node) bool {
-	return node.Type == "dir"
-}
-
-// IsLink checks if the given node as a link.
-func IsLink(node *restic.Node) bool {
-	return node.Type == "symlink"
-}
-
-// IsFile checks if the given node is a file.
-func IsFile(node *restic.Node) bool {
-	return node.Type == "file"
+	close(blobs)
+	return wg.Wait()
 }

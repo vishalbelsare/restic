@@ -2,7 +2,6 @@ package fs
 
 import (
 	"io"
-	"io/ioutil"
 	"os"
 	"testing"
 	"time"
@@ -13,14 +12,14 @@ import (
 )
 
 func TestNoatime(t *testing.T) {
-	f, err := ioutil.TempFile("", "restic-test-noatime")
+	f, err := os.CreateTemp("", "restic-test-noatime")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	defer func() {
 		_ = f.Close()
-		err = Remove(f.Name())
+		err = os.Remove(f.Name())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -59,9 +58,13 @@ func supportsNoatime(t *testing.T, f *os.File) bool {
 	err := unix.Fstatfs(int(f.Fd()), &fsinfo)
 	rtest.OK(t, err)
 
-	return fsinfo.Type == unix.BTRFS_SUPER_MAGIC ||
-		fsinfo.Type == unix.EXT2_SUPER_MAGIC ||
-		fsinfo.Type == unix.EXT3_SUPER_MAGIC ||
-		fsinfo.Type == unix.EXT4_SUPER_MAGIC ||
-		fsinfo.Type == unix.TMPFS_MAGIC
+	// The funky cast works around a compiler error on 32-bit archs:
+	// "unix.BTRFS_SUPER_MAGIC (untyped int constant 2435016766) overflows int32".
+	// https://github.com/golang/go/issues/52061
+	typ := int64(uint(fsinfo.Type))
+	return typ == unix.BTRFS_SUPER_MAGIC ||
+		typ == unix.EXT2_SUPER_MAGIC ||
+		typ == unix.EXT3_SUPER_MAGIC ||
+		typ == unix.EXT4_SUPER_MAGIC ||
+		typ == unix.TMPFS_MAGIC
 }

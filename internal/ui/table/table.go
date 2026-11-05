@@ -4,15 +4,16 @@ import (
 	"bytes"
 	"io"
 	"strings"
-
 	"text/template"
+
+	"github.com/restic/restic/internal/ui"
 )
 
 // Table contains data for a table to be printed.
 type Table struct {
 	columns   []string
 	templates []*template.Template
-	data      []interface{}
+	data      []any
 	footer    []string
 
 	CellSeparator  string
@@ -57,7 +58,7 @@ func (t *Table) AddColumn(header, format string) {
 }
 
 // AddRow adds a new row to the table, which is filled with data.
-func (t *Table) AddRow(data interface{}) {
+func (t *Table) AddRow(data any) {
 	t.data = append(t.data, data)
 }
 
@@ -79,7 +80,7 @@ func printLine(w io.Writer, print func(io.Writer, string) error, sep string, dat
 	}
 
 	for i := 0; i < maxLines; i++ {
-		var s string
+		var s strings.Builder
 
 		for fieldNum, lines := range fields {
 			var v string
@@ -89,7 +90,7 @@ func printLine(w io.Writer, print func(io.Writer, string) error, sep string, dat
 			}
 
 			// apply padding
-			pad := widths[fieldNum] - len(v)
+			pad := widths[fieldNum] - ui.DisplayWidth(v)
 			if pad > 0 {
 				v += strings.Repeat(" ", pad)
 			}
@@ -98,10 +99,10 @@ func printLine(w io.Writer, print func(io.Writer, string) error, sep string, dat
 				v = sep + v
 			}
 
-			s += v
+			s.WriteString(v)
 		}
 
-		err := print(w, strings.TrimRight(s, " "))
+		err := print(w, strings.TrimRight(s.String(), " "))
 		if err != nil {
 			return err
 		}
@@ -138,17 +139,19 @@ func (t *Table) Write(w io.Writer) error {
 	// find max width for each cell
 	columnWidths := make([]int, columns)
 	for i, desc := range t.columns {
-		for _, line := range strings.Split(desc, "\n") {
-			if columnWidths[i] < len(line) {
-				columnWidths[i] = len(desc)
+		for line := range strings.SplitSeq(desc, "\n") {
+			width := ui.DisplayWidth(line)
+			if columnWidths[i] < width {
+				columnWidths[i] = width
 			}
 		}
 	}
 	for _, line := range lines {
 		for i, content := range line {
-			for _, l := range strings.Split(content, "\n") {
-				if columnWidths[i] < len(l) {
-					columnWidths[i] = len(l)
+			for l := range strings.SplitSeq(content, "\n") {
+				width := ui.DisplayWidth(l)
+				if columnWidths[i] < width {
+					columnWidths[i] = width
 				}
 			}
 		}
@@ -159,7 +162,7 @@ func (t *Table) Write(w io.Writer) error {
 	for _, width := range columnWidths {
 		totalWidth += width
 	}
-	totalWidth += (columns - 1) * len(t.CellSeparator)
+	totalWidth += (columns - 1) * ui.DisplayWidth(t.CellSeparator)
 
 	// write header
 	if len(t.columns) > 0 {
@@ -177,10 +180,10 @@ func (t *Table) Write(w io.Writer) error {
 
 	// write all the lines
 	for i, line := range lines {
-		print := func(w io.Writer, s string) error {
+		printer := func(w io.Writer, s string) error {
 			return t.PrintData(w, i, s)
 		}
-		err := printLine(w, print, t.CellSeparator, line, columnWidths)
+		err := printLine(w, printer, t.CellSeparator, line, columnWidths)
 		if err != nil {
 			return err
 		}

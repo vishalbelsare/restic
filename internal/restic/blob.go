@@ -6,22 +6,19 @@ import (
 	"github.com/restic/restic/internal/errors"
 )
 
-// Blob is one part of a file or a tree.
-type Blob struct {
-	BlobHandle
-	Length uint
-	Offset uint
-}
-
-func (b Blob) String() string {
-	return fmt.Sprintf("<Blob (%v) %v, offset %v, length %v>",
-		b.Type, b.ID.Str(), b.Offset, b.Length)
-}
-
-// PackedBlob is a blob stored within a file.
-type PackedBlob struct {
-	Blob
-	PackID ID
+// PackBlob is one index entry for a blob in a pack file.
+// The interface intentionally omits the offset at which a blob is stored in the pack.
+// This ensures that pack file internals are not leaked.
+type PackBlob interface {
+	PackID() ID
+	Handle() BlobHandle
+	// CiphertextLength is the encrypted size stored in the pack.
+	CiphertextLength() uint
+	// UncompressedCiphertextLength is the encrypted size of the uncompressed blob.
+	UncompressedCiphertextLength() uint
+	// PlaintextLength is the size after decryption/decompression.
+	PlaintextLength() uint
+	IsCompressed() bool
 }
 
 // BlobHandle identifies a blob of a given type.
@@ -32,10 +29,6 @@ type BlobHandle struct {
 
 func (h BlobHandle) String() string {
 	return fmt.Sprintf("<%s/%s>", h.Type, h.ID.Str())
-}
-
-func NewRandomBlobHandle() BlobHandle {
-	return BlobHandle{ID: NewRandomID(), Type: DataBlob}
 }
 
 // BlobType specifies what a blob stored in a pack is.
@@ -60,6 +53,15 @@ func (t BlobType) String() string {
 	}
 
 	return fmt.Sprintf("<BlobType %d>", t)
+}
+
+func (t BlobType) IsMetadata() bool {
+	switch t {
+	case TreeBlob:
+		return true
+	default:
+		return false
+	}
 }
 
 // MarshalJSON encodes the BlobType into JSON.
@@ -101,11 +103,7 @@ func (h BlobHandles) Less(i, j int) bool {
 			continue
 		}
 
-		if b < h[j].ID[k] {
-			return true
-		}
-
-		return false
+		return b < h[j].ID[k]
 	}
 
 	return h[i].Type < h[j].Type
@@ -120,5 +118,5 @@ func (h BlobHandles) String() string {
 	for _, e := range h {
 		elements = append(elements, e.String())
 	}
-	return fmt.Sprintf("%v", elements)
+	return fmt.Sprint(elements)
 }

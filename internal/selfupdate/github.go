@@ -4,13 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/pkg/errors"
-	"golang.org/x/net/context/ctxhttp"
 )
 
 // Release collects data about a single release on GitHub.
@@ -46,6 +46,23 @@ type githubError struct {
 	Message string
 }
 
+func newGitHubRequest(ctx context.Context, url, acceptHeader string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// Set the Accept header to pin the API version
+	req.Header.Set("Accept", acceptHeader)
+
+	// Add Authorization header if token is available
+	if token := os.Getenv("GITHUB_ACCESS_TOKEN"); token != "" {
+		req.Header.Set("Authorization", "token "+token)
+	}
+
+	return req, nil
+}
+
 // GitHubLatestRelease uses the GitHub API to get information about the latest
 // release of a repository.
 func GitHubLatestRelease(ctx context.Context, owner, repo string) (Release, error) {
@@ -53,15 +70,12 @@ func GitHubLatestRelease(ctx context.Context, owner, repo string) (Release, erro
 	defer cancel()
 
 	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/latest", owner, repo)
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	req, err := newGitHubRequest(ctx, url, "application/vnd.github.v3+json")
 	if err != nil {
 		return Release{}, err
 	}
 
-	// pin API version 3
-	req.Header.Set("Accept", "application/vnd.github.v3+json")
-
-	res, err := ctxhttp.Do(ctx, http.DefaultClient, req)
+	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return Release{}, err
 	}
@@ -73,6 +87,7 @@ func GitHubLatestRelease(ctx context.Context, owner, repo string) (Release, erro
 			var msg githubError
 			jerr := json.NewDecoder(res.Body).Decode(&msg)
 			if jerr == nil {
+				_ = res.Body.Close()
 				return Release{}, fmt.Errorf("unexpected status %v (%v) returned, message:\n  %v", res.StatusCode, res.Status, msg.Message)
 			}
 		}
@@ -81,7 +96,7 @@ func GitHubLatestRelease(ctx context.Context, owner, repo string) (Release, erro
 		return Release{}, fmt.Errorf("unexpected status %v (%v) returned", res.StatusCode, res.Status)
 	}
 
-	buf, err := ioutil.ReadAll(res.Body)
+	buf, err := io.ReadAll(res.Body)
 	if err != nil {
 		_ = res.Body.Close()
 		return Release{}, err
@@ -112,24 +127,22 @@ func GitHubLatestRelease(ctx context.Context, owner, repo string) (Release, erro
 }
 
 func getGithubData(ctx context.Context, url string) ([]byte, error) {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	req, err := newGitHubRequest(ctx, url, "application/octet-stream")
 	if err != nil {
 		return nil, err
 	}
 
-	// request binary data
-	req.Header.Set("Accept", "application/octet-stream")
-
-	res, err := ctxhttp.Do(ctx, http.DefaultClient, req)
+	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 
 	if res.StatusCode != http.StatusOK {
+		_ = res.Body.Close()
 		return nil, fmt.Errorf("unexpected status %v (%v) returned", res.StatusCode, res.Status)
 	}
 
-	buf, err := ioutil.ReadAll(res.Body)
+	buf, err := io.ReadAll(res.Body)
 	if err != nil {
 		_ = res.Body.Close()
 		return nil, err
@@ -143,7 +156,7 @@ func getGithubData(ctx context.Context, url string) ([]byte, error) {
 	return buf, nil
 }
 
-func getGithubDataFile(ctx context.Context, assets []Asset, suffix string, printf func(string, ...interface{})) (filename string, data []byte, err error) {
+func getGithubDataFile(ctx context.Context, assets []Asset, suffix string, printf func(string, ...any)) (filename string, data []byte, err error) {
 	var url string
 	for _, a := range assets {
 		if strings.HasSuffix(a.Name, suffix) {

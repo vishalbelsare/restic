@@ -2,23 +2,23 @@
 REST Backend
 ************
 
-Restic can interact with HTTP Backend that respects the following REST
+Restic can interact with an HTTP backend that respects the following REST
 API.
 
 The following values are valid for ``{type}``:
 
- * ``data``
- * ``keys``
- * ``locks``
- * ``snapshots``
- * ``index``
- * ``config``
+* ``data``
+* ``keys``
+* ``locks``
+* ``snapshots``
+* ``index``
+* ``config``
 
 The API version is selected via the ``Accept`` HTTP header in the request. The
 following values are defined:
 
- * ``application/vnd.x.restic.rest.v1`` or empty: Select API version 1
- * ``application/vnd.x.restic.rest.v2``: Select API version 2
+* ``application/vnd.x.restic.rest.v1`` or empty: Select API version 1
+* ``application/vnd.x.restic.rest.v2``: Select API version 2
 
 The server will respond with the value of the highest version it supports in
 the ``Content-Type`` HTTP response header for the HTTP requests which should
@@ -40,8 +40,8 @@ DELETE {path}
 
 Deletes the repository on the server side. The server responds with "200
 OK" if the repository was successfully removed. If this function is not
-implemented the server returns "501 Not Implemented", if this it is
-denied by the server it returns "403 Forbidden".
+implemented the server returns "501 Not Implemented", if this is denied
+by the server it returns "403 Forbidden".
 
 HEAD {path}/config
 ==================

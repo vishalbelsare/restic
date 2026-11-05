@@ -1,59 +1,193 @@
 package termstatus
 
-import "testing"
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+	"testing"
 
-func TestTruncate(t *testing.T) {
+	tty "github.com/restic/restic/internal/terminal"
+	rtest "github.com/restic/restic/internal/test"
+)
+
+func TestSetStatus(t *testing.T) {
+	buf, term, cancel := setupStatusTest()
+
+	const (
+		cl   = tty.PosixControlClearLine
+		home = tty.PosixControlMoveCursorHome
+		up   = tty.PosixControlMoveCursorUp
+
+		clearLn = home + cl
+	)
+
+	term.SetStatus([]string{"first"})
+	exp := clearLn + "first" + home
+
+	term.SetStatus([]string{""})
+	exp += clearLn + "" + home
+
+	term.SetStatus([]string{})
+	exp += clearLn + "" + home
+
+	// already empty status
+	term.SetStatus([]string{})
+
+	term.SetStatus([]string{"foo", "bar", "baz"})
+	exp += clearLn + "foo\n" + clearLn + "bar\n" + clearLn + "baz" + home + up + up
+
+	term.SetStatus([]string{"quux", "needs\nquote"})
+	exp += clearLn + "quux\n" +
+		clearLn + "\"needs\\nquote\"\n" +
+		clearLn + home + up + up // Clear third line
+
+	cancel()
+	exp += clearLn + "\n" + clearLn + "" + home + up // Status cleared
+
+	<-term.closed
+	rtest.Equals(t, exp, buf.String())
+}
+
+func TestSetStatusUnchangedLines(t *testing.T) {
+	buf, term, cancel := setupStatusTest()
+
+	const (
+		cl   = tty.PosixControlClearLine
+		home = tty.PosixControlMoveCursorHome
+		up   = tty.PosixControlMoveCursorUp
+		down = tty.PosixControlMoveCursorDown
+
+		clearLn  = home + cl
+		stepDown = home + down
+	)
+
+	term.SetStatus([]string{"line1", "line2", "line3"})
+	exp := clearLn + "line1\n" + clearLn + "line2\n" + clearLn + "line3" + home + up + up
+
+	term.SetStatus([]string{"line1", "line2", "line3-changed"})
+	exp += stepDown + stepDown + clearLn + "line3-changed" + home + up + up
+
+	term.SetStatus([]string{"line1", "line2", "line3-changed"})
+
+	term.SetStatus([]string{"line1", "line2-new", "line3-changed"})
+	exp += stepDown + clearLn + "line2-new\n" + home + up + up
+
+	cancel()
+	exp += clearLn + "\n" + clearLn + "\n" + clearLn + "" + home + up + up
+
+	<-term.closed
+	rtest.Equals(t, exp, buf.String())
+}
+
+func setupStatusTest() (*bytes.Buffer, *terminal, context.CancelFunc) {
+	buf := &bytes.Buffer{}
+	term := new(nil, buf, buf, false)
+
+	term.canUpdateStatus = true
+	term.fd = ^uintptr(0)
+	term.clearCurrentLine = tty.PosixClearCurrentLine
+	term.moveCursorUp = tty.PosixMoveCursorUp
+	term.moveCursorDown = tty.PosixMoveCursorDown
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go term.Run(ctx)
+	return buf, term, cancel
+}
+
+func TestPrint(t *testing.T) {
+	buf, term, cancel := setupStatusTest()
+
+	const (
+		cl   = tty.PosixControlClearLine
+		home = tty.PosixControlMoveCursorHome
+	)
+
+	term.Print("test")
+	exp := home + cl + "test\n"
+	term.Error("error")
+	exp += home + cl + "error\n"
+
+	cancel()
+
+	<-term.closed
+	rtest.Equals(t, exp, buf.String())
+}
+
+func TestSanitizeLines(t *testing.T) {
 	var tests = []struct {
-		input  string
+		input  []string
 		width  int
-		output string
+		output []string
 	}{
-		{"", 80, ""},
-		{"", 0, ""},
-		{"", -1, ""},
-		{"foo", 80, "foo"},
-		{"foo", 4, "foo"},
-		{"foo", 3, "foo"},
-		{"foo", 2, "fo"},
-		{"foo", 1, "f"},
-		{"foo", 0, ""},
-		{"foo", -1, ""},
-		{"Löwen", 4, "Löwe"},
-		{"あああああ/data", 7, "あああ"},
-		{"あああああ/data", 10, "あああああ"},
-		{"あああああ/data", 11, "あああああ/"},
+		{[]string{""}, 80, []string{""}},
+		{[]string{"too long test line"}, 10, []string{"too long"}},
+		{[]string{"too long test line", "text"}, 10, []string{"too long", "text"}},
+		{[]string{"too long test line", "second long test line"}, 10, []string{"too long", "second l"}},
 	}
 
 	for _, test := range tests {
-		t.Run("", func(t *testing.T) {
-			out := Truncate(test.input, test.width)
-			if out != test.output {
-				t.Fatalf("wrong output for input %v, width %d: want %q, got %q",
-					test.input, test.width, test.output, out)
-			}
+		t.Run(fmt.Sprintf("%s %d", test.input, test.width), func(t *testing.T) {
+			out := sanitizeLines(test.input, test.width)
+			rtest.Equals(t, test.output, out)
 		})
 	}
 }
 
-func benchmarkTruncate(b *testing.B, s string, w int) {
-	for i := 0; i < b.N; i++ {
-		Truncate(s, w)
-	}
+type errorReader struct{ err error }
+
+func (r *errorReader) Read([]byte) (int, error) { return 0, r.err }
+
+func TestReadPassword(t *testing.T) {
+	want := errors.New("foo")
+	_, err := readPassword(&errorReader{want})
+	rtest.Assert(t, errors.Is(err, want), "wrong error %v", err)
 }
 
-func BenchmarkTruncateASCII(b *testing.B) {
-	s := "This is an ASCII-only status message...\r\n"
-	benchmarkTruncate(b, s, len(s)-1)
+func TestReadPasswordTerminal(t *testing.T) {
+	expected := "password"
+	term := new(io.NopCloser(strings.NewReader(expected)), io.Discard, io.Discard, false)
+	pw, err := term.ReadPassword(context.Background(), "test")
+	rtest.OK(t, err)
+	rtest.Equals(t, expected, pw)
 }
 
-func BenchmarkTruncateUnicode(b *testing.B) {
-	s := "Hello World or Καλημέρα κόσμε or こんにちは 世界"
-	w := 0
-	for _, r := range s {
-		w++
-		if wideRune(r) {
-			w++
-		}
-	}
-	benchmarkTruncate(b, s, w-1)
+func TestRawInputOutput(t *testing.T) {
+	input := io.NopCloser(strings.NewReader("password"))
+	var output bytes.Buffer
+	term, cancel := Setup(input, &output, io.Discard, false)
+	defer cancel()
+	rtest.Equals(t, input, term.InputRaw())
+	rtest.Equals(t, false, term.InputIsTerminal())
+	rtest.Equals(t, io.Writer(&output), term.OutputRaw())
+	rtest.Equals(t, false, term.OutputIsTerminal())
+	rtest.Equals(t, false, term.CanUpdateStatus())
+}
+
+func TestDisableStatus(t *testing.T) {
+	var output bytes.Buffer
+	term, cancel := Setup(nil, &output, &output, true)
+	rtest.Equals(t, false, term.CanUpdateStatus())
+
+	term.Print("test")
+	term.Error("error")
+	term.SetStatus([]string{"status"})
+
+	cancel()
+	rtest.Equals(t, "test\nerror\nstatus\n", output.String())
+}
+
+func TestOutputWriter(t *testing.T) {
+	var output bytes.Buffer
+	term, cancel := Setup(nil, &output, &output, true)
+
+	_, err := term.OutputWriter().Write([]byte("output\npartial"))
+	rtest.OK(t, err)
+	term.Print("test")
+	term.Error("error")
+
+	cancel()
+	rtest.Equals(t, "output\ntest\nerror\npartial\n", output.String())
 }

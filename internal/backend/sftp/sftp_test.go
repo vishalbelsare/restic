@@ -3,24 +3,24 @@ package sftp_test
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/restic/restic/internal/backend"
 	"github.com/restic/restic/internal/backend/sftp"
 	"github.com/restic/restic/internal/backend/test"
 	"github.com/restic/restic/internal/errors"
-	"github.com/restic/restic/internal/restic"
 	rtest "github.com/restic/restic/internal/test"
 )
 
 func findSFTPServerBinary() string {
-	for _, dir := range strings.Split(rtest.TestSFTPPath, ":") {
+	for dir := range strings.SplitSeq(rtest.TestSFTPPath, ":") {
 		testpath := filepath.Join(dir, "sftp-server")
 		_, err := os.Stat(testpath)
-		if !os.IsNotExist(errors.Cause(err)) {
+		if !errors.Is(err, os.ErrNotExist) {
 			return testpath
 		}
 	}
@@ -30,46 +30,26 @@ func findSFTPServerBinary() string {
 
 var sftpServer = findSFTPServerBinary()
 
-func newTestSuite(t testing.TB) *test.Suite {
-	return &test.Suite{
-		// NewConfig returns a config for a new temporary backend that will be used in tests.
-		NewConfig: func() (interface{}, error) {
-			dir, err := ioutil.TempDir(rtest.TestTempDir, "restic-test-sftp-")
-			if err != nil {
-				t.Fatal(err)
-			}
+func testConfig(path string) sftp.Config {
+	return sftp.Config{
+		Path:        path,
+		Command:     fmt.Sprintf("%q -e", sftpServer),
+		Connections: 5,
+	}
+}
 
+func newTestSuite(t testing.TB) *test.Suite[sftp.Config] {
+	return &test.Suite[sftp.Config]{
+		// NewConfig returns a config for a new temporary backend that will be used in tests.
+		NewConfig: func() (*sftp.Config, error) {
+			dir := rtest.TempDir(t)
 			t.Logf("create new backend at %v", dir)
 
-			cfg := sftp.Config{
-				Path:    dir,
-				Command: fmt.Sprintf("%q -e", sftpServer),
-			}
-			return cfg, nil
+			cfg := testConfig(dir)
+			return &cfg, nil
 		},
 
-		// CreateFn is a function that creates a temporary repository for the tests.
-		Create: func(config interface{}) (restic.Backend, error) {
-			cfg := config.(sftp.Config)
-			return sftp.Create(context.TODO(), cfg)
-		},
-
-		// OpenFn is a function that opens a previously created temporary repository.
-		Open: func(config interface{}) (restic.Backend, error) {
-			cfg := config.(sftp.Config)
-			return sftp.Open(context.TODO(), cfg)
-		},
-
-		// CleanupFn removes data created during the tests.
-		Cleanup: func(config interface{}) error {
-			cfg := config.(sftp.Config)
-			if !rtest.TestCleanupTempDirs {
-				t.Logf("leaving test backend dir at %v", cfg.Path)
-			}
-
-			rtest.RemoveAll(t, cfg.Path)
-			return nil
-		},
+		Factory: sftp.NewFactory(),
 	}
 }
 
@@ -93,4 +73,54 @@ func BenchmarkBackendSFTP(t *testing.B) {
 	}
 
 	newTestSuite(t).RunBenchmarks(t)
+}
+
+func TestCreateSetsDirPermissions(t *testing.T) {
+	if sftpServer == "" {
+		t.Skip("sftp server binary not found")
+	}
+
+	cfg := testConfig(filepath.Join(rtest.TempDir(t), "repo"))
+
+	be, err := sftp.Create(context.Background(), cfg, func(string, ...any) {})
+	rtest.OK(t, err)
+	defer func() { rtest.OK(t, be.Close()) }()
+
+	rtest.OK(t, filepath.WalkDir(cfg.Path, func(name string, d fs.DirEntry, err error) error {
+		if err != nil || !d.IsDir() {
+			return err
+		}
+		fi, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if mode := fi.Mode().Perm(); mode != 0o700 {
+			return fmt.Errorf("directory %v has mode %o, want 700", name, mode)
+		}
+		return nil
+	}))
+}
+
+func TestSaveSetsDirPermissions(t *testing.T) {
+	if sftpServer == "" {
+		t.Skip("sftp server binary not found")
+	}
+
+	cfg := testConfig(filepath.Join(rtest.TempDir(t), "repo"))
+
+	be, err := sftp.Create(context.Background(), cfg, func(string, ...any) {})
+	rtest.OK(t, err)
+	defer func() { rtest.OK(t, be.Close()) }()
+
+	// Remove a data subdirectory so that Save has to recreate it.
+	subdir := filepath.Join(cfg.Path, "data", "01")
+	rtest.OK(t, os.Remove(subdir))
+
+	data := []byte("test data")
+	h := backend.Handle{Type: backend.PackFile, Name: "0100000000000000000000000000000000000000000000000000000000000000"}
+	rtest.OK(t, be.Save(context.Background(), h, backend.NewByteReader(data, be.Hasher())))
+
+	fi, err := os.Stat(subdir)
+	rtest.OK(t, err)
+	rtest.Equals(t, os.FileMode(0o700), fi.Mode().Perm())
 }

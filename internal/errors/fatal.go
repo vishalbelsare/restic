@@ -1,38 +1,55 @@
 package errors
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+	"slices"
+)
 
 // fatalError is an error that should be printed to the user, then the program
 // should exit with an error code.
-type fatalError string
-
-func (e fatalError) Error() string {
-	return string(e)
+type fatalError struct {
+	msg string
+	err error // Underlying error
 }
 
-func (e fatalError) Fatal() bool {
-	return true
+func (e *fatalError) Error() string {
+	return e.msg
 }
 
-// Fataler is an error which should be printed to the user directly.
-// Afterwards, the program should exit with an error.
-type Fataler interface {
-	Fatal() bool
+func (e *fatalError) Unwrap() error {
+	return e.err
 }
 
 // IsFatal returns true if err is a fatal message that should be printed to the
 // user. Then, the program should exit.
 func IsFatal(err error) bool {
-	e, ok := err.(Fataler)
-	return ok && e.Fatal()
+	var fatal *fatalError
+	return errors.As(err, &fatal)
 }
 
-// Fatal returns a wrapped error which implements the Fataler interface.
+// Fatal returns an error that is marked fatal.
 func Fatal(s string) error {
-	return Wrap(fatalError(s), "Fatal")
+	return Wrap(&fatalError{msg: s}, "Fatal")
 }
 
-// Fatalf returns an error which implements the Fataler interface.
-func Fatalf(s string, data ...interface{}) error {
-	return Wrap(fatalError(fmt.Sprintf(s, data...)), "Fatal")
+// Fatalf returns an error that is marked fatal, preserving an underlying error if passed.
+func Fatalf(s string, data ...any) error {
+	// Use the last error found.
+	var underlyingErr error
+	for _, d := range slices.Backward(data) {
+		if err, ok := d.(error); ok {
+			underlyingErr = err
+			break
+		}
+	}
+
+	msg := fmt.Sprintf(s, data...)
+
+	fatal := &fatalError{
+		msg: msg,
+		err: underlyingErr,
+	}
+
+	return Wrap(fatal, "Fatal")
 }

@@ -1,11 +1,10 @@
-//+build windows
+//go:build windows
 
 package main
 
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 )
 
@@ -28,17 +27,17 @@ func (e *dirEntry) equals(out io.Writer, other *dirEntry) bool {
 	return true
 }
 
-func nlink(info os.FileInfo) uint64 {
+func nlink(_ os.FileInfo) uint64 {
 	return 1
 }
 
-func inode(info os.FileInfo) uint64 {
+func inode(_ os.FileInfo) uint64 {
 	return uint64(0)
 }
 
 func createFileSetPerHardlink(dir string) map[uint64][]string {
 	linkTests := make(map[uint64][]string)
-	files, err := ioutil.ReadDir(dir)
+	files, err := os.ReadDir(dir)
 	if err != nil {
 		return nil
 	}

@@ -9,8 +9,16 @@ import (
 
 // Config holds all information needed to open a local repository.
 type Config struct {
-	Path   string
-	Layout string `option:"layout" help:"use this backend directory layout (default: auto-detect)"`
+	Path string
+
+	Connections uint `option:"connections" help:"set a limit for the number of concurrent operations (default: 2)"`
+}
+
+// NewConfig returns a new config with default options applied.
+func NewConfig() Config {
+	return Config{
+		Connections: 2,
+	}
 }
 
 func init() {
@@ -18,10 +26,12 @@ func init() {
 }
 
 // ParseConfig parses a local backend config.
-func ParseConfig(cfg string) (interface{}, error) {
-	if !strings.HasPrefix(cfg, "local:") {
+func ParseConfig(s string) (*Config, error) {
+	if !strings.HasPrefix(s, "local:") {
 		return nil, errors.New(`invalid format, prefix "local" not found`)
 	}
 
-	return Config{Path: cfg[6:]}, nil
+	cfg := NewConfig()
+	cfg.Path = s[6:]
+	return &cfg, nil
 }

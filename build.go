@@ -3,8 +3,8 @@
 // This program aims to make building Go programs for end users easier by just
 // calling it with `go run`, without having to setup a GOPATH.
 //
-// This program needs Go >= 1.12. It'll use Go modules for compilation. It
-// builds the package configured as Main in the Config struct.
+// This program checks for a minimum Go version. It will use Go modules for
+// compilation. It builds the package configured as Main in the Config struct.
 
 // BSD 2-Clause License
 //
@@ -36,14 +36,12 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 //go:build ignore_build_go
-// +build ignore_build_go
 
 package main
 
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -54,12 +52,14 @@ import (
 
 // config contains the configuration for the program to build.
 var config = Config{
-	Name:             "restic",                                 // name of the program executable and directory
-	Namespace:        "github.com/restic/restic",               // subdir of GOPATH, e.g. "github.com/foo/bar"
-	Main:             "./cmd/restic",                           // package name for the main package
-	DefaultBuildTags: []string{"selfupdate"},                   // specify build tags which are always used
-	Tests:            []string{"./..."},                        // tests to run
-	MinVersion:       GoVersion{Major: 1, Minor: 11, Patch: 0}, // minimum Go version supported
+	Name:      "restic",                   // name of the program executable and directory
+	Namespace: "github.com/restic/restic", // subdir of GOPATH, e.g. "github.com/foo/bar"
+	Main:      "./cmd/restic",             // package name for the main package
+	// disable_grpc_modules is necessary to reduce the binary size since cloud.google.com/go/storage v1.44.0
+	// see https://github.com/googleapis/google-cloud-go/issues/11448
+	DefaultBuildTags: []string{"selfupdate", "disable_grpc_modules"}, // specify build tags which are always used
+	Tests:            []string{"./..."},                              // tests to run
+	MinVersion:       GoVersion{Major: 1, Minor: 26, Patch: 0},       // minimum Go version supported
 }
 
 // Config configures the build.
@@ -179,7 +179,7 @@ func test(cwd string, env map[string]string, args ...string) error {
 // getVersion returns the version string from the file VERSION in the current
 // directory.
 func getVersionFromFile() string {
-	buf, err := ioutil.ReadFile("VERSION")
+	buf, err := os.ReadFile("VERSION")
 	if err != nil {
 		verbosePrintf("error reading file VERSION: %v\n", err)
 		return ""
@@ -299,19 +299,21 @@ func (v GoVersion) AtLeast(other GoVersion) bool {
 		return true
 	}
 
+	if v.Major > other.Major {
+		return true
+	}
 	if v.Major < other.Major {
 		return false
 	}
 
+	if v.Minor > other.Minor {
+		return true
+	}
 	if v.Minor < other.Minor {
 		return false
 	}
 
-	if v.Patch < other.Patch {
-		return false
-	}
-
-	return true
+	return v.Patch >= other.Patch
 }
 
 func (v GoVersion) String() string {
@@ -319,12 +321,8 @@ func (v GoVersion) String() string {
 }
 
 func main() {
-	if !goVersion.AtLeast(GoVersion{1, 12, 0}) {
-		die("Go version (%v) is too old, restic requires Go >= 1.12\n", goVersion)
-	}
-
 	if !goVersion.AtLeast(config.MinVersion) {
-		fmt.Fprintf(os.Stderr, "%s detected, this program requires at least %s\n", goVersion, config.MinVersion)
+		fmt.Fprintf(os.Stderr, "Detected version %s is too old, restic requires at least %s\n", goVersion, config.MinVersion)
 		os.Exit(1)
 	}
 

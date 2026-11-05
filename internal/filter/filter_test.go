@@ -116,13 +116,13 @@ func TestMatch(t *testing.T) {
 
 		// Test with native path separator
 		if filepath.Separator != '/' {
-			pattern := strings.Replace(test.pattern, "/", string(filepath.Separator), -1)
+			pattern := strings.ReplaceAll(test.pattern, "/", string(filepath.Separator))
 			// Test with pattern as native
 			t.Run("pattern-native", func(t *testing.T) {
 				testpattern(t, pattern, test.path, test.match)
 			})
 
-			path := strings.Replace(test.path, "/", string(filepath.Separator), -1)
+			path := strings.ReplaceAll(test.path, "/", string(filepath.Separator))
 			t.Run("path-native", func(t *testing.T) {
 				// Test with path as native
 				testpattern(t, test.pattern, path, test.match)
@@ -206,13 +206,13 @@ func TestChildMatch(t *testing.T) {
 
 		// Test with native path separator
 		if filepath.Separator != '/' {
-			pattern := strings.Replace(test.pattern, "/", string(filepath.Separator), -1)
+			pattern := strings.ReplaceAll(test.pattern, "/", string(filepath.Separator))
 			// Test with pattern as native
 			t.Run("pattern-native", func(t *testing.T) {
 				testchildpattern(t, pattern, test.path, test.match)
 			})
 
-			path := strings.Replace(test.path, "/", string(filepath.Separator), -1)
+			path := strings.ReplaceAll(test.path, "/", string(filepath.Separator))
 			t.Run("path-native", func(t *testing.T) {
 				// Test with path as native
 				testchildpattern(t, test.pattern, path, test.match)
@@ -248,6 +248,7 @@ var filterListTests = []struct {
 }{
 	{[]string{}, "/foo/bar/test.go", false, false},
 	{[]string{"*.go"}, "/foo/bar/test.go", true, true},
+	{[]string{"*.go"}, "/foo/bar", false, true},
 	{[]string{"*.c"}, "/foo/bar/test.go", false, true},
 	{[]string{"*.go", "*.c"}, "/foo/bar/test.go", true, true},
 	{[]string{"*"}, "/foo/bar/test.go", true, true},
@@ -255,8 +256,25 @@ var filterListTests = []struct {
 	{[]string{"?"}, "/foo/bar/test.go", false, true},
 	{[]string{"?", "x"}, "/foo/bar/x", true, true},
 	{[]string{"/*/*/bar/test.*"}, "/foo/bar/test.go", false, false},
+	{[]string{"/*/*/bar/test.*"}, "/foo/bar/bar", false, true},
 	{[]string{"/*/*/bar/test.*", "*.go"}, "/foo/bar/test.go", true, true},
 	{[]string{"", "*.c"}, "/foo/bar/test.go", false, true},
+	{[]string{"!**", "*.go"}, "/foo/bar/test.go", true, true},
+	{[]string{"!**", "*.c"}, "/foo/bar/test.go", false, true},
+	{[]string{"/foo/*/test.*", "!*.c"}, "/foo/bar/test.c", false, false},
+	{[]string{"/foo/*/test.*", "!*.c"}, "/foo/bar/test.go", true, true},
+	{[]string{"/foo/*/*", "!test.*", "*.c"}, "/foo/bar/test.go", false, true},
+	{[]string{"/foo/*/*", "!test.*", "*.c"}, "/foo/bar/test.c", true, true},
+	{[]string{"/foo/*/*", "!test.*", "*.c"}, "/foo/bar/file.go", true, true},
+	{[]string{"/**/*", "!/foo", "/foo/*", "!/foo/bar"}, "/foo/other/test.go", true, true},
+	{[]string{"/**/*", "!/foo", "/foo/*", "!/foo/bar"}, "/foo/bar", false, false},
+	{[]string{"/**/*", "!/foo", "/foo/*", "!/foo/bar"}, "/foo/bar/test.go", false, false},
+	{[]string{"/**/*", "!/foo", "/foo/*", "!/foo/bar"}, "/foo/bar/test.go/child", false, false},
+	{[]string{"/**/*", "!/foo", "/foo/*", "!/foo/bar", "/foo/bar/test*"}, "/foo/bar/test.go/child", true, true},
+	{[]string{"/foo/bar/*"}, "/foo", false, true},
+	{[]string{"/foo/bar/*", "!/foo/bar/[a-m]*"}, "/foo", false, true},
+	{[]string{"/foo/**/test.c"}, "/foo/bar/foo/bar/test.c", true, true},
+	{[]string{"/foo/*/test.c"}, "/foo/bar/foo/bar/test.c", false, false},
 }
 
 func TestList(t *testing.T) {
@@ -371,7 +389,7 @@ func TestFilterPatternsFile(t *testing.T) {
 
 			if match {
 				c++
-				// fmt.Printf("pattern %q, line %q\n", test.pattern, line)
+				// t.Logf("pattern %q, line %q\n", test.pattern, line)
 			}
 		}
 

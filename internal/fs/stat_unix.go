@@ -1,23 +1,21 @@
-// +build !windows,!darwin,!freebsd,!netbsd
+//go:build !windows && !darwin && !freebsd && !netbsd
 
 package fs
 
 import (
-	"fmt"
 	"os"
 	"syscall"
 	"time"
 )
 
 // extendedStat extracts info into an ExtendedFileInfo for unix based operating systems.
-func extendedStat(fi os.FileInfo) ExtendedFileInfo {
-	s, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok {
-		panic(fmt.Sprintf("conversion to syscall.Stat_t failed, type is %T", fi.Sys()))
-	}
+func extendedStat(fi os.FileInfo) *ExtendedFileInfo {
+	s := fi.Sys().(*syscall.Stat_t)
 
-	extFI := ExtendedFileInfo{
-		FileInfo:  fi,
+	return &ExtendedFileInfo{
+		Name: fi.Name(),
+		Mode: fi.Mode(),
+
 		DeviceID:  uint64(s.Dev),
 		Inode:     s.Ino,
 		Links:     uint64(s.Nlink),
@@ -32,6 +30,9 @@ func extendedStat(fi os.FileInfo) ExtendedFileInfo {
 		ModTime:    time.Unix(s.Mtim.Unix()),
 		ChangeTime: time.Unix(s.Ctim.Unix()),
 	}
+}
 
-	return extFI
+// RecallOnDataAccess checks windows-specific attributes to determine if a file is a cloud-only placeholder.
+func (*ExtendedFileInfo) RecallOnDataAccess() (bool, error) {
+	return false, nil
 }

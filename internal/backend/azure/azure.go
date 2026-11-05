@@ -1,117 +1,221 @@
 package azure
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/base64"
+	"fmt"
 	"hash"
 	"io"
 	"net/http"
-	"os"
 	"path"
 	"strings"
 
 	"github.com/restic/restic/internal/backend"
+	"github.com/restic/restic/internal/backend/layout"
+	"github.com/restic/restic/internal/backend/location"
+	"github.com/restic/restic/internal/backend/util"
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/errors"
-	"github.com/restic/restic/internal/restic"
 
-	"github.com/Azure/azure-sdk-for-go/storage"
-	"github.com/cenkalti/backoff/v4"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/streaming"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
+	azContainer "github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 )
 
 // Backend stores data on an azure endpoint.
 type Backend struct {
-	accountName  string
-	container    *storage.Container
-	sem          *backend.Semaphore
-	prefix       string
-	listMaxItems int
-	backend.Layout
+	cfg         Config
+	container   *azContainer.Client
+	connections uint
+	layout.Layout
+
+	accessTier blob.AccessTier
 }
 
+const singleUploadMaxSize = 256 * 1024 * 1024
+const singleBlockMaxSize = 100 * 1024 * 1024
 const defaultListMaxItems = 5000
 
 // make sure that *Backend implements backend.Backend
-var _ restic.Backend = &Backend{}
+var _ backend.Backend = &Backend{}
+
+func NewFactory() location.Factory {
+	return location.NewHTTPBackendFactory("azure", ParseConfig, location.NoPassword, Create, Open)
+}
 
 func open(cfg Config, rt http.RoundTripper) (*Backend, error) {
 	debug.Log("open, config %#v", cfg)
 
-	client, err := storage.NewBasicClient(cfg.AccountName, cfg.AccountKey)
-	if err != nil {
-		return nil, errors.Wrap(err, "NewBasicClient")
+	var client *azContainer.Client
+	var err error
+
+	var endpointSuffix string
+	if cfg.EndpointSuffix != "" {
+		endpointSuffix = cfg.EndpointSuffix
+	} else {
+		endpointSuffix = "core.windows.net"
 	}
 
-	client.HTTPClient = &http.Client{Transport: rt}
+	if cfg.AccountName == "" {
+		return nil, errors.Fatalf("unable to open Azure backend: Account name ($AZURE_ACCOUNT_NAME) is empty")
+	}
 
-	service := client.GetBlobService()
+	url := fmt.Sprintf("https://%s.blob.%s/%s", cfg.AccountName, endpointSuffix, cfg.Container)
+	opts := &azContainer.ClientOptions{
+		ClientOptions: azcore.ClientOptions{
+			Transport: &http.Client{Transport: rt},
+		},
+	}
 
-	sem, err := backend.NewSemaphore(cfg.Connections)
-	if err != nil {
-		return nil, err
+	if cfg.AccountKey.String() != "" {
+		// We have an account key value, find the BlobServiceClient
+		// from with a BasicClient
+		debug.Log(" - using account key")
+		cred, err := azblob.NewSharedKeyCredential(cfg.AccountName, cfg.AccountKey.Unwrap())
+		if err != nil {
+			return nil, errors.Wrap(err, "NewSharedKeyCredential")
+		}
+
+		client, err = azContainer.NewClientWithSharedKeyCredential(url, cred, opts)
+
+		if err != nil {
+			return nil, errors.Wrap(err, "NewClientWithSharedKeyCredential")
+		}
+	} else if cfg.AccountSAS.String() != "" {
+		// Get the client using the SAS Token as authentication, this
+		// is longer winded than above because the SDK wants a URL for the Account
+		// if your using a SAS token, and not just the account name
+		// we (as per the SDK ) assume the default Azure portal.
+		// https://github.com/Azure/azure-storage-blob-go/issues/130
+		debug.Log(" - using sas token")
+		sas := cfg.AccountSAS.Unwrap()
+
+		// strip query sign prefix
+		if sas[0] == '?' {
+			sas = sas[1:]
+		}
+
+		urlWithSAS := fmt.Sprintf("%s?%s", url, sas)
+
+		client, err = azContainer.NewClientWithNoCredential(urlWithSAS, opts)
+		if err != nil {
+			return nil, errors.Wrap(err, "NewAccountSASClientFromEndpointToken")
+		}
+	} else {
+		var cred azcore.TokenCredential
+
+		if cfg.ForceCliCredential {
+			debug.Log(" - using AzureCLICredential")
+			cred, err = azidentity.NewAzureCLICredential(nil)
+			if err != nil {
+				return nil, errors.Wrap(err, "NewAzureCLICredential")
+			}
+		} else {
+			debug.Log(" - using DefaultAzureCredential")
+			cred, err = azidentity.NewDefaultAzureCredential(nil)
+			if err != nil {
+				return nil, errors.Wrap(err, "NewDefaultAzureCredential")
+			}
+		}
+
+		client, err = azContainer.NewClient(url, cred, opts)
+		if err != nil {
+			return nil, errors.Wrap(err, "NewClient")
+		}
+	}
+
+	var accessTier blob.AccessTier
+	// if the access tier is not supported, then we will not set the access tier; during the upload process,
+	// the value will be inferred from the default configured on the storage account.
+	for _, tier := range supportedAccessTiers() {
+		if strings.EqualFold(string(tier), cfg.AccessTier) {
+			accessTier = tier
+			debug.Log(" - using access tier %v", accessTier)
+			break
+		}
 	}
 
 	be := &Backend{
-		container:   service.GetContainerReference(cfg.Container),
-		accountName: cfg.AccountName,
-		sem:         sem,
-		prefix:      cfg.Prefix,
-		Layout: &backend.DefaultLayout{
-			Path: cfg.Prefix,
-			Join: path.Join,
-		},
-		listMaxItems: defaultListMaxItems,
+		container:   client,
+		cfg:         cfg,
+		connections: cfg.Connections,
+		Layout:      layout.NewDefaultLayout(cfg.Prefix, path.Join),
+		accessTier:  accessTier,
 	}
 
 	return be, nil
 }
 
+func supportedAccessTiers() []blob.AccessTier {
+	return []blob.AccessTier{blob.AccessTierHot, blob.AccessTierCool, blob.AccessTierCold, blob.AccessTierArchive}
+}
+
 // Open opens the Azure backend at specified container.
-func Open(cfg Config, rt http.RoundTripper) (*Backend, error) {
+func Open(_ context.Context, cfg Config, rt http.RoundTripper, _ func(string, ...any)) (*Backend, error) {
 	return open(cfg, rt)
 }
 
 // Create opens the Azure backend at specified container and creates the container if
 // it does not exist yet.
-func Create(cfg Config, rt http.RoundTripper) (*Backend, error) {
+func Create(ctx context.Context, cfg Config, rt http.RoundTripper, _ func(string, ...any)) (*Backend, error) {
 	be, err := open(cfg, rt)
 
 	if err != nil {
 		return nil, errors.Wrap(err, "open")
 	}
 
-	options := storage.CreateContainerOptions{
-		Access: storage.ContainerAccessTypePrivate,
-	}
+	_, err = be.container.GetProperties(ctx, &azContainer.GetPropertiesOptions{})
 
-	_, err = be.container.CreateIfNotExists(&options)
-	if err != nil {
-		return nil, errors.Wrap(err, "container.CreateIfNotExists")
+	if err != nil && bloberror.HasCode(err, bloberror.ContainerNotFound) {
+		_, err = be.container.Create(ctx, &azContainer.CreateOptions{})
+
+		if err != nil {
+			return nil, errors.Wrap(err, "container.Create")
+		}
+	} else if err != nil && bloberror.HasCode(err, bloberror.AuthorizationFailure) {
+		// We ignore this Auth. Failure, as the failure is related to the type
+		// of SAS/SAT, not an actual real failure. If the token is invalid, we
+		// fail later on anyway.
+		// For details see Issue #4004.
+		debug.Log("Ignoring AuthorizationFailure when calling GetProperties")
+	} else if err != nil {
+		return be, errors.Wrap(err, "container.GetProperties")
 	}
 
 	return be, nil
 }
 
-// SetListMaxItems sets the number of list items to load per request.
-func (be *Backend) SetListMaxItems(i int) {
-	be.listMaxItems = i
-}
-
 // IsNotExist returns true if the error is caused by a not existing file.
 func (be *Backend) IsNotExist(err error) bool {
-	debug.Log("IsNotExist(%T, %#v)", err, err)
-	return os.IsNotExist(err)
+	return bloberror.HasCode(err, bloberror.BlobNotFound)
 }
 
-// Join combines path components with slashes.
-func (be *Backend) Join(p ...string) string {
-	return path.Join(p...)
+func (be *Backend) IsPermanentError(err error) bool {
+	if be.IsNotExist(err) {
+		return true
+	}
+
+	var aerr *azcore.ResponseError
+	if errors.As(err, &aerr) {
+		if aerr.StatusCode == http.StatusRequestedRangeNotSatisfiable || aerr.StatusCode == http.StatusUnauthorized || aerr.StatusCode == http.StatusForbidden {
+			return true
+		}
+	}
+	return false
 }
 
-// Location returns this backend's location (the container name).
-func (be *Backend) Location() string {
-	return be.Join(be.container.Name, be.prefix)
+func (be *Backend) Properties() backend.Properties {
+	return backend.Properties{
+		Connections:      be.connections,
+		HasAtomicReplace: true,
+	}
 }
 
 // Hasher may return a hash function for calculating a content hash for the backend
@@ -119,68 +223,68 @@ func (be *Backend) Hasher() hash.Hash {
 	return md5.New()
 }
 
-// Path returns the path in the bucket that is used for this backend.
-func (be *Backend) Path() string {
-	return be.prefix
-}
-
-type azureAdapter struct {
-	restic.RewindReader
-}
-
-func (azureAdapter) Close() error { return nil }
-
-func (a azureAdapter) Len() int {
-	return int(a.Length())
+// useAccessTier determines whether to apply the configured access tier to a given file.
+// For archive access tier, only data files are stored using that class; metadata
+// must remain instantly accessible.
+func (be *Backend) useAccessTier(h backend.Handle) bool {
+	notArchiveClass := !strings.EqualFold(be.cfg.AccessTier, "archive")
+	isDataFile := h.Type == backend.PackFile && !h.IsMetadata
+	return isDataFile || notArchiveClass
 }
 
 // Save stores data in the backend at the handle.
-func (be *Backend) Save(ctx context.Context, h restic.Handle, rd restic.RewindReader) error {
-	if err := h.Valid(); err != nil {
-		return backoff.Permanent(err)
-	}
-
+func (be *Backend) Save(ctx context.Context, h backend.Handle, rd backend.RewindReader) error {
 	objName := be.Filename(h)
 
-	debug.Log("Save %v at %v", h, objName)
+	debug.Log("InsertObject(%v, %v)", be.cfg.AccountName, objName)
 
-	be.sem.GetToken()
-
-	debug.Log("InsertObject(%v, %v)", be.container.Name, objName)
+	var accessTier blob.AccessTier
+	if be.useAccessTier(h) {
+		accessTier = be.accessTier
+	}
 
 	var err error
-	if rd.Length() < 256*1024*1024 {
-		// wrap the reader so that net/http client cannot close the reader
-		// CreateBlockBlobFromReader reads length from `Len()``
-		dataReader := azureAdapter{rd}
+	fileSize := rd.Length()
 
-		// if it's smaller than 256miB, then just create the file directly from the reader
-		ref := be.container.GetBlobReference(objName)
-		ref.Properties.ContentMD5 = base64.StdEncoding.EncodeToString(rd.Hash())
-		err = ref.CreateBlockBlobFromReader(dataReader, nil)
+	// If the file size is less than or equal to the max size for a single blob, use the single blob upload
+	// otherwise, use the block-based upload
+	if fileSize <= singleUploadMaxSize {
+		err = be.saveSingleBlob(ctx, objName, rd, accessTier)
 	} else {
-		// otherwise use the more complicated method
-		err = be.saveLarge(ctx, objName, rd)
-
+		err = be.saveLarge(ctx, objName, rd, accessTier)
 	}
 
-	be.sem.ReleaseToken()
-	debug.Log("%v, err %#v", objName, err)
-
-	return errors.Wrap(err, "CreateBlockBlobFromReader")
+	return err
 }
 
-func (be *Backend) saveLarge(ctx context.Context, objName string, rd restic.RewindReader) error {
-	// create the file on the server
-	file := be.container.GetBlobReference(objName)
-	err := file.CreateBlockBlob(nil)
+// saveSingleBlob uploads data using a single Put Blob operation.
+// This method is more efficient for files under 5000 MiB as it requires only one API call
+// instead of the two calls (StageBlock + CommitBlockList) required by the block-based approach.
+func (be *Backend) saveSingleBlob(ctx context.Context, objName string, rd backend.RewindReader, accessTier blob.AccessTier) error {
+	blockBlobClient := be.container.NewBlockBlobClient(objName)
+
+	buf := make([]byte, rd.Length())
+	_, err := io.ReadFull(rd, buf)
 	if err != nil {
-		return errors.Wrap(err, "CreateBlockBlob")
+		return errors.Wrap(err, "ReadFull")
 	}
 
-	// read the data, in 100 MiB chunks
-	buf := make([]byte, 100*1024*1024)
-	var blocks []storage.Block
+	reader := bytes.NewReader(buf)
+	opts := &blockblob.UploadOptions{
+		Tier:                    &accessTier,
+		TransactionalValidation: blob.TransferValidationTypeMD5(rd.Hash()),
+	}
+
+	debug.Log("Upload single blob %v with %d bytes", objName, len(buf))
+	_, err = blockBlobClient.Upload(ctx, streaming.NopCloser(reader), opts)
+	return errors.Wrap(err, "Upload")
+}
+
+func (be *Backend) saveLarge(ctx context.Context, objName string, rd backend.RewindReader, accessTier blob.AccessTier) error {
+	blockBlobClient := be.container.NewBlockBlobClient(objName)
+
+	buf := make([]byte, singleBlockMaxSize)
+	blocks := []string{}
 	uploadedBytes := 0
 
 	for {
@@ -188,6 +292,7 @@ func (be *Backend) saveLarge(ctx context.Context, objName string, rd restic.Rewi
 		if err == io.ErrUnexpectedEOF {
 			err = nil
 		}
+
 		if err == io.EOF {
 			// end of file reached, no bytes have been read at all
 			break
@@ -203,16 +308,18 @@ func (be *Backend) saveLarge(ctx context.Context, objName string, rd restic.Rewi
 		// upload it as a new "block", use the base64 hash for the ID
 		h := md5.Sum(buf)
 		id := base64.StdEncoding.EncodeToString(h[:])
-		debug.Log("PutBlock %v with %d bytes", id, len(buf))
-		err = file.PutBlock(id, buf, &storage.PutBlockOptions{ContentMD5: id})
+
+		reader := bytes.NewReader(buf)
+		debug.Log("StageBlock %v with %d bytes", id, len(buf))
+		_, err = blockBlobClient.StageBlock(ctx, id, streaming.NopCloser(reader), &blockblob.StageBlockOptions{
+			TransactionalValidation: blob.TransferValidationTypeMD5(h[:]),
+		})
+
 		if err != nil {
-			return errors.Wrap(err, "PutBlock")
+			return errors.Wrap(err, "StageBlock")
 		}
 
-		blocks = append(blocks, storage.Block{
-			ID:     id,
-			Status: "Uncommitted",
-		})
+		blocks = append(blocks, id)
 	}
 
 	// sanity check
@@ -220,129 +327,78 @@ func (be *Backend) saveLarge(ctx context.Context, objName string, rd restic.Rewi
 		return errors.Errorf("wrote %d bytes instead of the expected %d bytes", uploadedBytes, rd.Length())
 	}
 
+	_, err := blockBlobClient.CommitBlockList(ctx, blocks, &blockblob.CommitBlockListOptions{
+		Tier: &accessTier,
+	})
+
 	debug.Log("uploaded %d parts: %v", len(blocks), blocks)
-	err = file.PutBlockList(blocks, nil)
-	debug.Log("PutBlockList returned %v", err)
-	return errors.Wrap(err, "PutBlockList")
-}
-
-// wrapReader wraps an io.ReadCloser to run an additional function on Close.
-type wrapReader struct {
-	io.ReadCloser
-	f func()
-}
-
-func (wr wrapReader) Close() error {
-	err := wr.ReadCloser.Close()
-	wr.f()
-	return err
+	return errors.Wrap(err, "CommitBlockList")
 }
 
 // Load runs fn with a reader that yields the contents of the file at h at the
 // given offset.
-func (be *Backend) Load(ctx context.Context, h restic.Handle, length int, offset int64, fn func(rd io.Reader) error) error {
-	return backend.DefaultLoad(ctx, h, length, offset, be.openReader, fn)
+func (be *Backend) Load(ctx context.Context, h backend.Handle, length int, offset int64, fn func(rd io.Reader) error) error {
+	return util.DefaultLoad(ctx, h, length, offset, be.openReader, fn)
 }
 
-func (be *Backend) openReader(ctx context.Context, h restic.Handle, length int, offset int64) (io.ReadCloser, error) {
-	debug.Log("Load %v, length %v, offset %v from %v", h, length, offset, be.Filename(h))
-	if err := h.Valid(); err != nil {
-		return nil, backoff.Permanent(err)
-	}
-
-	if offset < 0 {
-		return nil, errors.New("offset is negative")
-	}
-
-	if length < 0 {
-		return nil, errors.Errorf("invalid length %d", length)
-	}
-
+func (be *Backend) openReader(ctx context.Context, h backend.Handle, length int, offset int64) (io.ReadCloser, error) {
 	objName := be.Filename(h)
-	blob := be.container.GetBlobReference(objName)
+	blockBlobClient := be.container.NewBlobClient(objName)
 
-	start := uint64(offset)
-	var end uint64
+	resp, err := blockBlobClient.DownloadStream(ctx, &blob.DownloadStreamOptions{
+		Range: azblob.HTTPRange{
+			Offset: offset,
+			Count:  int64(length),
+		},
+	})
 
-	if length > 0 {
-		end = uint64(offset + int64(length) - 1)
-	} else {
-		end = 0
-	}
-
-	be.sem.GetToken()
-
-	rd, err := blob.GetRange(&storage.GetBlobRangeOptions{Range: &storage.BlobRange{Start: start, End: end}})
 	if err != nil {
-		be.sem.ReleaseToken()
 		return nil, err
 	}
 
-	closeRd := wrapReader{
-		ReadCloser: rd,
-		f: func() {
-			debug.Log("Close()")
-			be.sem.ReleaseToken()
-		},
+	if length > 0 && (resp.ContentLength == nil || *resp.ContentLength != int64(length)) {
+		_ = resp.Body.Close()
+		return nil, &azcore.ResponseError{ErrorCode: "restic-file-too-short", StatusCode: http.StatusRequestedRangeNotSatisfiable}
 	}
 
-	return closeRd, err
+	return resp.Body, err
 }
 
 // Stat returns information about a blob.
-func (be *Backend) Stat(ctx context.Context, h restic.Handle) (restic.FileInfo, error) {
-	debug.Log("%v", h)
-
+func (be *Backend) Stat(ctx context.Context, h backend.Handle) (backend.FileInfo, error) {
 	objName := be.Filename(h)
-	blob := be.container.GetBlobReference(objName)
+	blobClient := be.container.NewBlobClient(objName)
 
-	be.sem.GetToken()
-	err := blob.GetProperties(nil)
-	be.sem.ReleaseToken()
+	props, err := blobClient.GetProperties(ctx, nil)
 
 	if err != nil {
-		debug.Log("blob.GetProperties err %v", err)
-		return restic.FileInfo{}, errors.Wrap(err, "blob.GetProperties")
+		return backend.FileInfo{}, errors.Wrap(err, "blob.GetProperties")
 	}
 
-	fi := restic.FileInfo{
-		Size: int64(blob.Properties.ContentLength),
+	fi := backend.FileInfo{
+		Size: *props.ContentLength,
 		Name: h.Name,
 	}
 	return fi, nil
 }
 
-// Test returns true if a blob of the given type and name exists in the backend.
-func (be *Backend) Test(ctx context.Context, h restic.Handle) (bool, error) {
-	objName := be.Filename(h)
-
-	be.sem.GetToken()
-	found, err := be.container.GetBlobReference(objName).Exists()
-	be.sem.ReleaseToken()
-
-	if err != nil {
-		return false, err
-	}
-	return found, nil
-}
-
 // Remove removes the blob with the given name and type.
-func (be *Backend) Remove(ctx context.Context, h restic.Handle) error {
+func (be *Backend) Remove(ctx context.Context, h backend.Handle) error {
 	objName := be.Filename(h)
+	blob := be.container.NewBlobClient(objName)
 
-	be.sem.GetToken()
-	_, err := be.container.GetBlobReference(objName).DeleteIfExists(nil)
-	be.sem.ReleaseToken()
+	_, err := blob.Delete(ctx, &azblob.DeleteBlobOptions{})
 
-	debug.Log("Remove(%v) at %v -> err %v", h, objName, err)
+	if be.IsNotExist(err) {
+		return nil
+	}
+
 	return errors.Wrap(err, "client.RemoveObject")
 }
 
 // List runs fn for each file in the backend which has the type t. When an
 // error occurs (or fn returns an error), List stops and returns it.
-func (be *Backend) List(ctx context.Context, t restic.FileType, fn func(restic.FileInfo) error) error {
-	debug.Log("listing %v", t)
-
+func (be *Backend) List(ctx context.Context, t backend.FileType, fn func(backend.FileInfo) error) error {
 	prefix, _ := be.Basedir(t)
 
 	// make sure prefix ends with a slash
@@ -350,31 +406,32 @@ func (be *Backend) List(ctx context.Context, t restic.FileType, fn func(restic.F
 		prefix += "/"
 	}
 
-	params := storage.ListBlobsParameters{
-		MaxResults: uint(be.listMaxItems),
-		Prefix:     prefix,
-	}
+	maxI := int32(defaultListMaxItems)
 
-	for {
-		be.sem.GetToken()
-		obj, err := be.container.ListBlobs(params)
-		be.sem.ReleaseToken()
+	opts := &azContainer.ListBlobsFlatOptions{
+		MaxResults: &maxI,
+		Prefix:     &prefix,
+	}
+	lister := be.container.NewListBlobsFlatPager(opts)
+
+	for lister.More() {
+		resp, err := lister.NextPage(ctx)
 
 		if err != nil {
 			return err
 		}
 
-		debug.Log("got %v objects", len(obj.Blobs))
+		debug.Log("got %v objects", len(resp.Segment.BlobItems))
 
-		for _, item := range obj.Blobs {
-			m := strings.TrimPrefix(item.Name, prefix)
+		for _, item := range resp.Segment.BlobItems {
+			m := strings.TrimPrefix(*item.Name, prefix)
 			if m == "" {
 				continue
 			}
 
-			fi := restic.FileInfo{
+			fi := backend.FileInfo{
 				Name: path.Base(m),
-				Size: item.Properties.ContentLength,
+				Size: *item.Properties.ContentLength,
 			}
 
 			if ctx.Err() != nil {
@@ -391,41 +448,21 @@ func (be *Backend) List(ctx context.Context, t restic.FileType, fn func(restic.F
 			}
 
 		}
-
-		if obj.NextMarker == "" {
-			break
-		}
-		params.Marker = obj.NextMarker
 	}
 
 	return ctx.Err()
 }
 
-// Remove keys for a specified backend type.
-func (be *Backend) removeKeys(ctx context.Context, t restic.FileType) error {
-	return be.List(ctx, t, func(fi restic.FileInfo) error {
-		return be.Remove(ctx, restic.Handle{Type: t, Name: fi.Name})
-	})
-}
-
 // Delete removes all restic keys in the bucket. It will not remove the bucket itself.
 func (be *Backend) Delete(ctx context.Context) error {
-	alltypes := []restic.FileType{
-		restic.PackFile,
-		restic.KeyFile,
-		restic.LockFile,
-		restic.SnapshotFile,
-		restic.IndexFile}
-
-	for _, t := range alltypes {
-		err := be.removeKeys(ctx, t)
-		if err != nil {
-			return nil
-		}
-	}
-
-	return be.Remove(ctx, restic.Handle{Type: restic.ConfigFile})
+	return util.DefaultDelete(ctx, be)
 }
 
 // Close does nothing
 func (be *Backend) Close() error { return nil }
+
+// Warmup not implemented
+func (be *Backend) Warmup(_ context.Context, _ []backend.Handle) ([]backend.Handle, error) {
+	return []backend.Handle{}, nil
+}
+func (be *Backend) WarmupWait(_ context.Context, _ []backend.Handle) error { return nil }

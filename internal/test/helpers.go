@@ -5,7 +5,7 @@ import (
 	"compress/gzip"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,36 +14,32 @@ import (
 	"testing"
 
 	"github.com/restic/restic/internal/errors"
-
-	mrand "math/rand"
 )
 
 // Assert fails the test if the condition is false.
-func Assert(tb testing.TB, condition bool, msg string, v ...interface{}) {
+func Assert(tb testing.TB, condition bool, msg string, v ...any) {
+	tb.Helper()
 	if !condition {
-		_, file, line, _ := runtime.Caller(1)
-		fmt.Printf("\033[31m%s:%d: "+msg+"\033[39m\n\n", append([]interface{}{filepath.Base(file), line}, v...)...)
-		tb.FailNow()
+		tb.Fatalf("\033[31m"+msg+"\033[39m\n\n", v...)
 	}
 }
 
 // OK fails the test if an err is not nil.
 func OK(tb testing.TB, err error) {
+	tb.Helper()
 	if err != nil {
-		_, file, line, _ := runtime.Caller(1)
-		fmt.Printf("\033[31m%s:%d: unexpected error: %+v\033[39m\n\n", filepath.Base(file), line, err)
-		tb.FailNow()
+		tb.Fatalf("\033[31munexpected error: %+v\033[39m\n\n", err)
 	}
 }
 
 // OKs fails the test if any error from errs is not nil.
 func OKs(tb testing.TB, errs []error) {
+	tb.Helper()
 	errFound := false
 	for _, err := range errs {
 		if err != nil {
 			errFound = true
-			_, file, line, _ := runtime.Caller(1)
-			fmt.Printf("\033[31m%s:%d: unexpected error: %+v\033[39m\n\n", filepath.Base(file), line, err.Error())
+			tb.Logf("\033[31munexpected error: %+v\033[39m\n\n", err.Error())
 		}
 	}
 	if errFound {
@@ -52,11 +48,22 @@ func OKs(tb testing.TB, errs []error) {
 }
 
 // Equals fails the test if exp is not equal to act.
-func Equals(tb testing.TB, exp, act interface{}) {
+// msg is optional message to be printed, first param being format string and rest being arguments.
+func Equals[T any](tb testing.TB, exp, act T, msgs ...string) {
+	tb.Helper()
 	if !reflect.DeepEqual(exp, act) {
-		_, file, line, _ := runtime.Caller(1)
-		fmt.Printf("\033[31m%s:%d:\n\n\texp: %#v\n\n\tgot: %#v\033[39m\n\n", filepath.Base(file), line, exp, act)
-		tb.FailNow()
+		var msgString string
+		length := len(msgs)
+		if length == 1 {
+			msgString = msgs[0]
+		} else if length > 1 {
+			args := make([]any, length-1)
+			for i, msg := range msgs[1:] {
+				args[i] = msg
+			}
+			msgString = fmt.Sprintf(msgs[0], args...)
+		}
+		tb.Fatalf("\033[31m\n\n\t"+msgString+"\n\n\texp: %#v\n\n\tgot: %#v\033[39m\n\n", exp, act)
 	}
 }
 
@@ -64,7 +71,7 @@ func Equals(tb testing.TB, exp, act interface{}) {
 func Random(seed, count int) []byte {
 	p := make([]byte, count)
 
-	rnd := mrand.New(mrand.NewSource(int64(seed)))
+	rnd := rand.New(rand.NewSource(int64(seed)))
 
 	for i := 0; i < len(p); i += 8 {
 		val := rnd.Int63()
@@ -93,6 +100,7 @@ func Random(seed, count int) []byte {
 
 // SetupTarTestFixture extracts the tarFile to outputDir.
 func SetupTarTestFixture(t testing.TB, outputDir, tarFile string) {
+	t.Helper()
 	input, err := os.Open(tarFile)
 	OK(t, err)
 	defer func() {
@@ -115,7 +123,13 @@ func SetupTarTestFixture(t testing.TB, outputDir, tarFile string) {
 		rd = input
 	}
 
-	cmd := exec.Command("tar", "xf", "-")
+	cmdLine := []string{"tar", "xf", "-"}
+	// Do not restore ownership from the archive. It is not necessary for the tests,
+	// but can cause problems in sandboxed environments.
+	if runtime.GOOS != "windows" {
+		cmdLine = append(cmdLine, "--no-same-owner")
+	}
+	cmd := exec.Command(cmdLine[0], cmdLine[1:]...)
 	cmd.Dir = outputDir
 
 	cmd.Stdin = rd
@@ -130,9 +144,18 @@ func SetupTarTestFixture(t testing.TB, outputDir, tarFile string) {
 
 // Env creates a test environment and extracts the repository fixture.
 // Returned is the repo path and a cleanup function.
-func Env(t testing.TB, repoFixture string) (repodir string, cleanup func()) {
-	tempdir, err := ioutil.TempDir(TestTempDir, "restic-test-env-")
-	OK(t, err)
+func Env(t testing.TB, repoFixture string) string {
+	t.Helper()
+
+	var tempdir string
+	if TestCleanupTempDirs {
+		tempdir = t.TempDir()
+	} else {
+		var err error
+		tempdir, err = os.MkdirTemp(TestTempDir, "restic-test-env-")
+		OK(t, err)
+		t.Logf("leaving temporary directory %v used for test", tempdir)
+	}
 
 	fd, err := os.Open(repoFixture)
 	if err != nil {
@@ -142,24 +165,18 @@ func Env(t testing.TB, repoFixture string) (repodir string, cleanup func()) {
 
 	SetupTarTestFixture(t, tempdir, repoFixture)
 
-	return filepath.Join(tempdir, "repo"), func() {
-		if !TestCleanupTempDirs {
-			t.Logf("leaving temporary directory %v used for test", tempdir)
-			return
-		}
-
-		RemoveAll(t, tempdir)
-	}
+	return filepath.Join(tempdir, "repo")
 }
 
 func isFile(fi os.FileInfo) bool {
 	return fi.Mode()&(os.ModeType|os.ModeCharDevice) == 0
 }
 
-// ResetReadOnly recursively resets the read-only flag recursively for dir.
+// resetReadOnly recursively resets the read-only flag recursively for dir.
 // This is mainly used for tests on Windows, which is unable to delete a file
 // set read-only.
-func ResetReadOnly(t testing.TB, dir string) {
+func resetReadOnly(t testing.TB, dir string) {
+	t.Helper()
 	err := filepath.Walk(dir, func(path string, fi os.FileInfo, err error) error {
 		if fi == nil {
 			return err
@@ -175,7 +192,7 @@ func ResetReadOnly(t testing.TB, dir string) {
 
 		return nil
 	})
-	if os.IsNotExist(errors.Cause(err)) {
+	if errors.Is(err, os.ErrNotExist) {
 		err = nil
 	}
 	OK(t, err)
@@ -184,30 +201,37 @@ func ResetReadOnly(t testing.TB, dir string) {
 // RemoveAll recursively resets the read-only flag of all files and dirs and
 // afterwards uses os.RemoveAll() to remove the path.
 func RemoveAll(t testing.TB, path string) {
-	ResetReadOnly(t, path)
-	err := os.RemoveAll(path)
-	if os.IsNotExist(errors.Cause(err)) {
+	t.Helper()
+	var err error
+	err = os.RemoveAll(path)
+	if err != nil {
+		resetReadOnly(t, path)
+		err = os.RemoveAll(path)
+	}
+	if errors.Is(err, os.ErrNotExist) {
 		err = nil
 	}
 	OK(t, err)
 }
 
-// TempDir returns a temporary directory that is removed when cleanup is
-// called, except if TestCleanupTempDirs is set to false.
-func TempDir(t testing.TB) (path string, cleanup func()) {
-	tempdir, err := ioutil.TempDir(TestTempDir, "restic-test-")
+// TempDir returns a temporary directory that is removed by t.Cleanup,
+// except if TestCleanupTempDirs is set to false.
+func TempDir(t testing.TB) string {
+	t.Helper()
+	tempdir, err := os.MkdirTemp(TestTempDir, "restic-test-")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	return tempdir, func() {
+	t.Cleanup(func() {
 		if !TestCleanupTempDirs {
 			t.Logf("leaving temporary directory %v used for test", tempdir)
 			return
 		}
 
 		RemoveAll(t, tempdir)
-	}
+	})
+	return tempdir
 }
 
 // Chdir changes the current directory to dest.

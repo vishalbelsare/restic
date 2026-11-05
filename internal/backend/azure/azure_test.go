@@ -2,7 +2,6 @@ package azure_test
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"io"
 	"os"
@@ -12,74 +11,29 @@ import (
 	"github.com/restic/restic/internal/backend"
 	"github.com/restic/restic/internal/backend/azure"
 	"github.com/restic/restic/internal/backend/test"
-	"github.com/restic/restic/internal/errors"
+	"github.com/restic/restic/internal/options"
 	"github.com/restic/restic/internal/restic"
 	rtest "github.com/restic/restic/internal/test"
 )
 
-func newAzureTestSuite(t testing.TB) *test.Suite {
-	tr, err := backend.Transport(backend.TransportOptions{})
-	if err != nil {
-		t.Fatalf("cannot create transport for tests: %v", err)
-	}
-
-	return &test.Suite{
+func newAzureTestSuite() *test.Suite[azure.Config] {
+	return &test.Suite[azure.Config]{
 		// do not use excessive data
 		MinimalData: true,
 
 		// NewConfig returns a config for a new temporary backend that will be used in tests.
-		NewConfig: func() (interface{}, error) {
-			azcfg, err := azure.ParseConfig(os.Getenv("RESTIC_TEST_AZURE_REPOSITORY"))
+		NewConfig: func() (*azure.Config, error) {
+			cfg, err := azure.ParseConfig(os.Getenv("RESTIC_TEST_AZURE_REPOSITORY"))
 			if err != nil {
 				return nil, err
 			}
 
-			cfg := azcfg.(azure.Config)
-			cfg.AccountName = os.Getenv("RESTIC_TEST_AZURE_ACCOUNT_NAME")
-			cfg.AccountKey = os.Getenv("RESTIC_TEST_AZURE_ACCOUNT_KEY")
+			cfg.ApplyEnvironment("RESTIC_TEST_")
 			cfg.Prefix = fmt.Sprintf("test-%d", time.Now().UnixNano())
 			return cfg, nil
 		},
 
-		// CreateFn is a function that creates a temporary repository for the tests.
-		Create: func(config interface{}) (restic.Backend, error) {
-			cfg := config.(azure.Config)
-
-			be, err := azure.Create(cfg, tr)
-			if err != nil {
-				return nil, err
-			}
-
-			exists, err := be.Test(context.TODO(), restic.Handle{Type: restic.ConfigFile})
-			if err != nil {
-				return nil, err
-			}
-
-			if exists {
-				return nil, errors.New("config already exists")
-			}
-
-			return be, nil
-		},
-
-		// OpenFn is a function that opens a previously created temporary repository.
-		Open: func(config interface{}) (restic.Backend, error) {
-			cfg := config.(azure.Config)
-
-			return azure.Open(cfg, tr)
-		},
-
-		// CleanupFn removes data created during the tests.
-		Cleanup: func(config interface{}) error {
-			cfg := config.(azure.Config)
-
-			be, err := azure.Open(cfg, tr)
-			if err != nil {
-				return err
-			}
-
-			return be.Delete(context.TODO())
-		},
+		Factory: azure.NewFactory(),
 	}
 }
 
@@ -104,7 +58,7 @@ func TestBackendAzure(t *testing.T) {
 	}
 
 	t.Logf("run tests")
-	newAzureTestSuite(t).RunTests(t)
+	newAzureTestSuite().RunTests(t)
 }
 
 func BenchmarkBackendAzure(t *testing.B) {
@@ -122,7 +76,90 @@ func BenchmarkBackendAzure(t *testing.B) {
 	}
 
 	t.Logf("run tests")
-	newAzureTestSuite(t).RunBenchmarks(t)
+	newAzureTestSuite().RunBenchmarks(t)
+}
+
+// TestBackendAzureAccountToken tests that a Storage Account SAS/SAT token can authorize.
+// This test ensures that restic can use a token that was generated using the storage
+// account keys can be used to authorize the azure connection.
+// Requires the RESTIC_TEST_AZURE_ACCOUNT_NAME, RESTIC_TEST_AZURE_REPOSITORY, and the
+// RESTIC_TEST_AZURE_ACCOUNT_SAS environment variables to be set, otherwise this test
+// will be skipped.
+func TestBackendAzureAccountToken(t *testing.T) {
+	vars := []string{
+		"RESTIC_TEST_AZURE_ACCOUNT_NAME",
+		"RESTIC_TEST_AZURE_REPOSITORY",
+		"RESTIC_TEST_AZURE_ACCOUNT_SAS",
+	}
+
+	for _, v := range vars {
+		if os.Getenv(v) == "" {
+			t.Skipf("set %v to test SAS/SAT Token Authentication", v)
+			return
+		}
+	}
+
+	ctx := t.Context()
+
+	cfg, err := azure.ParseConfig(os.Getenv("RESTIC_TEST_AZURE_REPOSITORY"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg.AccountName = os.Getenv("RESTIC_TEST_AZURE_ACCOUNT_NAME")
+	cfg.AccountSAS = options.NewSecretString(os.Getenv("RESTIC_TEST_AZURE_ACCOUNT_SAS"))
+
+	tr, err := backend.Transport(backend.TransportOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = azure.Create(ctx, *cfg, tr, t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestBackendAzureContainerToken tests that a container SAS/SAT token can authorize.
+// This test ensures that restic can use a token that was generated using a user
+// delegation key against the container we are storing data in can be used to
+// authorize the azure connection.
+// Requires the RESTIC_TEST_AZURE_ACCOUNT_NAME, RESTIC_TEST_AZURE_REPOSITORY, and the
+// RESTIC_TEST_AZURE_CONTAINER_SAS environment variables to be set, otherwise this test
+// will be skipped.
+func TestBackendAzureContainerToken(t *testing.T) {
+	vars := []string{
+		"RESTIC_TEST_AZURE_ACCOUNT_NAME",
+		"RESTIC_TEST_AZURE_REPOSITORY",
+		"RESTIC_TEST_AZURE_CONTAINER_SAS",
+	}
+
+	for _, v := range vars {
+		if os.Getenv(v) == "" {
+			t.Skipf("set %v to test SAS/SAT Token Authentication", v)
+			return
+		}
+	}
+
+	ctx := t.Context()
+
+	cfg, err := azure.ParseConfig(os.Getenv("RESTIC_TEST_AZURE_REPOSITORY"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg.AccountName = os.Getenv("RESTIC_TEST_AZURE_ACCOUNT_NAME")
+	cfg.AccountSAS = options.NewSecretString(os.Getenv("RESTIC_TEST_AZURE_CONTAINER_SAS"))
+
+	tr, err := backend.Transport(backend.TransportOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = azure.Create(ctx, *cfg, tr, t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestUploadLargeFile(t *testing.T) {
@@ -131,22 +168,20 @@ func TestUploadLargeFile(t *testing.T) {
 		return
 	}
 
-	ctx, cancel := context.WithCancel(context.TODO())
-	defer cancel()
+	ctx := t.Context()
 
 	if os.Getenv("RESTIC_TEST_AZURE_REPOSITORY") == "" {
 		t.Skipf("environment variables not available")
 		return
 	}
 
-	azcfg, err := azure.ParseConfig(os.Getenv("RESTIC_TEST_AZURE_REPOSITORY"))
+	cfg, err := azure.ParseConfig(os.Getenv("RESTIC_TEST_AZURE_REPOSITORY"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	cfg := azcfg.(azure.Config)
 	cfg.AccountName = os.Getenv("RESTIC_TEST_AZURE_ACCOUNT_NAME")
-	cfg.AccountKey = os.Getenv("RESTIC_TEST_AZURE_ACCOUNT_KEY")
+	cfg.AccountKey = options.NewSecretString(os.Getenv("RESTIC_TEST_AZURE_ACCOUNT_KEY"))
 	cfg.Prefix = fmt.Sprintf("test-upload-large-%d", time.Now().UnixNano())
 
 	tr, err := backend.Transport(backend.TransportOptions{})
@@ -154,7 +189,7 @@ func TestUploadLargeFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	be, err := azure.Create(cfg, tr)
+	be, err := azure.Create(ctx, *cfg, tr, t.Logf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,11 +203,11 @@ func TestUploadLargeFile(t *testing.T) {
 
 	data := rtest.Random(23, 300*1024*1024)
 	id := restic.Hash(data)
-	h := restic.Handle{Name: id.String(), Type: restic.PackFile}
+	h := backend.Handle{Name: id.String(), Type: backend.PackFile}
 
 	t.Logf("hash of %d bytes: %v", len(data), id)
 
-	err = be.Save(ctx, h, restic.NewByteReader(data, be.Hasher()))
+	err = be.Save(ctx, h, backend.NewByteReader(data, be.Hasher()))
 	if err != nil {
 		t.Fatal(err)
 	}

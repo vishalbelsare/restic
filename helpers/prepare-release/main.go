@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,7 +31,7 @@ var opts = struct {
 var versionRegex = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
 
 func init() {
-	pflag.BoolVar(&opts.IgnoreBranchName, "ignore-branch-name", false, "allow releasing from other branches as 'master'")
+	pflag.BoolVar(&opts.IgnoreBranchName, "ignore-branch-name", false, "allow releasing from other branches than 'master'")
 	pflag.BoolVar(&opts.IgnoreUncommittedChanges, "ignore-uncommitted-changes", false, "allow uncommitted changes")
 	pflag.BoolVar(&opts.IgnoreChangelogVersion, "ignore-changelog-version", false, "ignore missing entry in CHANGELOG.md")
 	pflag.BoolVar(&opts.IgnoreChangelogReleaseDate, "ignore-changelog-release-date", false, "ignore missing subdir with date in changelog/")
@@ -43,7 +43,7 @@ func init() {
 	pflag.Parse()
 }
 
-func die(f string, args ...interface{}) {
+func die(f string, args ...any) {
 	if !strings.HasSuffix(f, "\n") {
 		f += "\n"
 	}
@@ -52,7 +52,7 @@ func die(f string, args ...interface{}) {
 	os.Exit(1)
 }
 
-func msg(f string, args ...interface{}) {
+func msg(f string, args ...any) {
 	if !strings.HasSuffix(f, "\n") {
 		f += "\n"
 	}
@@ -73,13 +73,13 @@ func run(cmd string, args ...string) {
 func replace(filename, from, to string) {
 	reg := regexp.MustCompile(from)
 
-	buf, err := ioutil.ReadFile(filename)
+	buf, err := os.ReadFile(filename)
 	if err != nil {
 		die("error reading file %v: %v", filename, err)
 	}
 
 	buf = reg.ReplaceAll(buf, []byte(to))
-	err = ioutil.WriteFile(filename, buf, 0644)
+	err = os.WriteFile(filename, buf, 0644)
 	if err != nil {
 		die("error writing file %v: %v", filename, err)
 	}
@@ -128,17 +128,22 @@ func uncommittedChanges(dirs ...string) string {
 	return string(changes)
 }
 
-func preCheckBranchMaster() {
-	if opts.IgnoreBranchName {
-		return
-	}
-
+func getBranchName() string {
 	branch, err := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD").Output()
 	if err != nil {
 		die("error running 'git': %v", err)
 	}
 
-	if strings.TrimSpace(string(branch)) != "master" {
+	return strings.TrimSpace(string(branch))
+}
+
+func preCheckBranchMaster() {
+	if opts.IgnoreBranchName {
+		return
+	}
+
+	branch := getBranchName()
+	if branch != "master" {
 		die("wrong branch: %s", branch)
 	}
 }
@@ -290,6 +295,7 @@ func generateFiles() {
 	run("./restic-generate.temp", "generate",
 		"--man", "doc/man",
 		"--zsh-completion", "doc/zsh-completion.zsh",
+		"--powershell-completion", "doc/powershell-completion.ps1",
 		"--fish-completion", "doc/fish-completion.fish",
 		"--bash-completion", "doc/bash-completion.sh")
 	rm("restic-generate.temp")
@@ -302,17 +308,17 @@ func generateFiles() {
 	}
 }
 
-var versionPattern = `var version = ".*"`
+var versionPattern = `const Version = ".*"`
 
-const versionCodeFile = "cmd/restic/global.go"
+const versionCodeFile = "internal/global/global.go"
 
 func updateVersion() {
-	err := ioutil.WriteFile("VERSION", []byte(opts.Version+"\n"), 0644)
+	err := os.WriteFile("VERSION", []byte(opts.Version+"\n"), 0644)
 	if err != nil {
 		die("unable to write version to file: %v", err)
 	}
 
-	newVersion := fmt.Sprintf("var version = %q", opts.Version)
+	newVersion := fmt.Sprintf("const Version = %q", opts.Version)
 	replace(versionCodeFile, versionPattern, newVersion)
 
 	if len(uncommittedChanges("VERSION")) > 0 || len(uncommittedChanges(versionCodeFile)) > 0 {
@@ -322,7 +328,12 @@ func updateVersion() {
 }
 
 func updateVersionDev() {
-	newVersion := fmt.Sprintf(`var version = "%s-dev (compiled manually)"`, opts.Version)
+	err := os.WriteFile("VERSION", []byte(opts.Version+"-dev\n"), 0644)
+	if err != nil {
+		die("unable to write version to file: %v", err)
+	}
+
+	newVersion := fmt.Sprintf(`const Version = "%s-dev (compiled manually)"`, opts.Version)
 	replace(versionCodeFile, versionPattern, newVersion)
 
 	msg("committing cmd/restic/global.go with dev version")
@@ -365,7 +376,7 @@ func runBuild(sourceDir, outputDir, version string) {
 }
 
 func readdir(dir string) []string {
-	fis, err := ioutil.ReadDir(dir)
+	fis, err := os.ReadDir(dir)
 	if err != nil {
 		die("readdir %v failed: %v", dir, err)
 	}
@@ -378,7 +389,7 @@ func readdir(dir string) []string {
 }
 
 func sha256sums(inputDir, outputFile string) {
-	msg("runnnig sha256sum in %v", inputDir)
+	msg("running sha256sum in %v", inputDir)
 
 	filenames := readdir(inputDir)
 
@@ -409,17 +420,23 @@ func signFiles(filenames ...string) {
 	}
 }
 
-func updateDocker(outputDir, version string) {
-	cmd := fmt.Sprintf("bzcat %s/restic_%s_linux_amd64.bz2 > restic", outputDir, version)
-	run("sh", "-c", cmd)
-	run("chmod", "+x", "restic")
-	run("docker", "pull", "alpine:latest")
-	run("docker", "build", "--rm", "--tag", "restic/restic:latest", "-f", "docker/Dockerfile", ".")
-	run("docker", "tag", "restic/restic:latest", "restic/restic:"+version)
+func updateDocker(sourceDir, version string) string {
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	builderName := fmt.Sprintf("restic-release-builder-%d", r.Int())
+	run("docker", "buildx", "create", "--name", builderName, "--driver", "docker-container", "--bootstrap")
+
+	buildCmd := fmt.Sprintf("docker buildx build --builder %s --platform linux/386,linux/amd64,linux/arm,linux/arm64 --pull -f docker/Dockerfile.release %q", builderName, sourceDir)
+	run("sh", "-c", buildCmd+" --no-cache")
+
+	var publishCmds strings.Builder
+	for _, tag := range []string{"restic/restic:latest", "restic/restic:" + version} {
+		publishCmds.WriteString(buildCmd + fmt.Sprintf(" --tag %q --push\n", tag))
+	}
+	return publishCmds.String() + "\ndocker buildx rm " + builderName
 }
 
 func tempdir(prefix string) string {
-	dir, err := ioutil.TempDir(getwd(), prefix)
+	dir, err := os.MkdirTemp(getwd(), prefix)
 	if err != nil {
 		die("unable to create temp dir %q: %v", prefix, err)
 	}
@@ -437,6 +454,7 @@ func main() {
 	}
 
 	preCheckBranchMaster()
+	branch := getBranchName()
 	preCheckUncommittedChanges()
 	preCheckVersionExists()
 	preCheckDockerBuilderGoVersion()
@@ -464,15 +482,14 @@ func main() {
 
 	extractTar(tarFilename, sourceDir)
 	runBuild(sourceDir, opts.OutputDir, opts.Version)
-	rmdir(sourceDir)
 
 	sha256sums(opts.OutputDir, filepath.Join(opts.OutputDir, "SHA256SUMS"))
 
 	signFiles(filepath.Join(opts.OutputDir, "SHA256SUMS"), tarFilename)
 
-	updateDocker(opts.OutputDir, opts.Version)
+	dockerCmds := updateDocker(sourceDir, opts.Version)
 
 	msg("done, output dir is %v", opts.OutputDir)
 
-	msg("now run:\n\ngit push --tags origin master\ndocker push restic/restic:latest\ndocker push restic/restic:%s\n", opts.Version)
+	msg("now run:\n\ngit push --tags origin %s\n%s\n\nrm -rf %q", branch, dockerCmds, sourceDir)
 }

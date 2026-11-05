@@ -1,10 +1,12 @@
 package b2
 
 import (
+	"os"
 	"path"
 	"regexp"
 	"strings"
 
+	"github.com/restic/restic/internal/backend"
 	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/options"
 )
@@ -13,7 +15,7 @@ import (
 // server.
 type Config struct {
 	AccountID string
-	Key       string
+	Key       options.SecretString
 	Bucket    string
 	Prefix    string
 
@@ -37,7 +39,7 @@ var bucketName = regexp.MustCompile("^[a-zA-Z0-9-]+$")
 // https://help.backblaze.com/hc/en-us/articles/217666908-What-you-need-to-know-about-B2-Bucket-names
 func checkBucketName(name string) error {
 	if name == "" {
-		return errors.New("bucket name is empty")
+		return errors.New("bucket name not found")
 	}
 
 	if len(name) < 6 {
@@ -58,36 +60,36 @@ func checkBucketName(name string) error {
 // ParseConfig parses the string s and extracts the b2 config. The supported
 // configuration format is b2:bucketname/prefix. If no prefix is given the
 // prefix "restic" will be used.
-func ParseConfig(s string) (interface{}, error) {
+func ParseConfig(s string) (*Config, error) {
 	if !strings.HasPrefix(s, "b2:") {
 		return nil, errors.New("invalid format, want: b2:bucket-name[:path]")
 	}
 
 	s = s[3:]
-	data := strings.SplitN(s, ":", 2)
-	if len(data) == 0 || len(data[0]) == 0 {
-		return nil, errors.New("bucket name not found")
-	}
-
-	cfg := NewConfig()
-	cfg.Bucket = data[0]
-
-	if err := checkBucketName(cfg.Bucket); err != nil {
+	bucket, prefix, _ := strings.Cut(s, ":")
+	if err := checkBucketName(bucket); err != nil {
 		return nil, err
 	}
 
-	if len(data) == 2 {
-		p := data[1]
-		if len(p) > 0 {
-			p = path.Clean(p)
-		}
-
-		if len(p) > 0 && path.IsAbs(p) {
-			p = p[1:]
-		}
-
-		cfg.Prefix = p
+	if len(prefix) > 0 {
+		prefix = strings.TrimPrefix(path.Clean(prefix), "/")
 	}
 
-	return cfg, nil
+	cfg := NewConfig()
+	cfg.Bucket = bucket
+	cfg.Prefix = prefix
+
+	return &cfg, nil
+}
+
+var _ backend.ApplyEnvironmenter = &Config{}
+
+// ApplyEnvironment saves values from the environment to the config.
+func (cfg *Config) ApplyEnvironment(prefix string) {
+	if cfg.AccountID == "" {
+		cfg.AccountID = os.Getenv(prefix + "B2_ACCOUNT_ID")
+	}
+	if cfg.Key.String() == "" {
+		cfg.Key = options.NewSecretString(os.Getenv(prefix + "B2_ACCOUNT_KEY"))
+	}
 }

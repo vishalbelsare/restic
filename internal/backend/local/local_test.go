@@ -2,56 +2,30 @@ package local_test
 
 import (
 	"context"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/restic/restic/internal/backend/local"
 	"github.com/restic/restic/internal/backend/test"
-	"github.com/restic/restic/internal/restic"
 	rtest "github.com/restic/restic/internal/test"
 )
 
-func newTestSuite(t testing.TB) *test.Suite {
-	return &test.Suite{
+func newTestSuite(t testing.TB) *test.Suite[local.Config] {
+	return &test.Suite[local.Config]{
 		// NewConfig returns a config for a new temporary backend that will be used in tests.
-		NewConfig: func() (interface{}, error) {
-			dir, err := ioutil.TempDir(rtest.TestTempDir, "restic-test-local-")
-			if err != nil {
-				t.Fatal(err)
-			}
-
+		NewConfig: func() (*local.Config, error) {
+			dir := rtest.TempDir(t)
 			t.Logf("create new backend at %v", dir)
 
-			cfg := local.Config{
-				Path: dir,
+			cfg := &local.Config{
+				Path:        dir,
+				Connections: 2,
 			}
 			return cfg, nil
 		},
 
-		// CreateFn is a function that creates a temporary repository for the tests.
-		Create: func(config interface{}) (restic.Backend, error) {
-			cfg := config.(local.Config)
-			return local.Create(context.TODO(), cfg)
-		},
-
-		// OpenFn is a function that opens a previously created temporary repository.
-		Open: func(config interface{}) (restic.Backend, error) {
-			cfg := config.(local.Config)
-			return local.Open(context.TODO(), cfg)
-		},
-
-		// CleanupFn removes data created during the tests.
-		Cleanup: func(config interface{}) error {
-			cfg := config.(local.Config)
-			if !rtest.TestCleanupTempDirs {
-				t.Logf("leaving test backend dir at %v", cfg.Path)
-			}
-
-			rtest.RemoveAll(t, cfg.Path)
-			return nil
-		},
+		Factory: local.NewFactory(),
 	}
 }
 
@@ -92,7 +66,7 @@ func empty(t testing.TB, dir string) {
 func openclose(t testing.TB, dir string) {
 	cfg := local.Config{Path: dir}
 
-	be, err := local.Open(context.TODO(), cfg)
+	be, err := local.Open(context.TODO(), cfg, t.Logf)
 	if err != nil {
 		t.Logf("Open returned error %v", err)
 	}
@@ -120,8 +94,7 @@ func removeAll(t testing.TB, dir string) {
 }
 
 func TestOpenNotExistingDirectory(t *testing.T) {
-	dir, cleanup := rtest.TempDir(t)
-	defer cleanup()
+	dir := rtest.TempDir(t)
 
 	// local.Open must not create any files dirs in the repo
 	openclose(t, filepath.Join(dir, "repo"))

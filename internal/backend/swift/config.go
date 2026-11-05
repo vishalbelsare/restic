@@ -4,6 +4,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/restic/restic/internal/backend"
 	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/options"
 )
@@ -14,7 +15,7 @@ type Config struct {
 	UserID         string
 	Domain         string
 	DomainID       string
-	APIKey         string
+	APIKey         options.SecretString
 	AuthURL        string
 	Region         string
 	Tenant         string
@@ -24,12 +25,12 @@ type Config struct {
 	TrustID        string
 
 	StorageURL string
-	AuthToken  string
+	AuthToken  options.SecretString
 
 	// auth v3 only
 	ApplicationCredentialID     string
 	ApplicationCredentialName   string
-	ApplicationCredentialSecret string
+	ApplicationCredentialSecret options.SecretString
 
 	Container              string
 	Prefix                 string
@@ -50,18 +51,14 @@ func NewConfig() Config {
 }
 
 // ParseConfig parses the string s and extract swift's container name and prefix.
-func ParseConfig(s string) (interface{}, error) {
-	data := strings.SplitN(s, ":", 3)
-	if len(data) != 3 {
+func ParseConfig(s string) (*Config, error) {
+	if !strings.HasPrefix(s, "swift:") {
 		return nil, errors.New("invalid URL, expected: swift:container-name:/[prefix]")
 	}
+	s = strings.TrimPrefix(s, "swift:")
 
-	scheme, container, prefix := data[0], data[1], data[2]
-	if scheme != "swift" {
-		return nil, errors.Errorf("unexpected prefix: %s", data[0])
-	}
-
-	if len(prefix) == 0 {
+	container, prefix, _ := strings.Cut(s, ":")
+	if prefix == "" {
 		return nil, errors.Errorf("prefix is empty")
 	}
 
@@ -74,54 +71,65 @@ func ParseConfig(s string) (interface{}, error) {
 	cfg.Container = container
 	cfg.Prefix = prefix
 
-	return cfg, nil
+	return &cfg, nil
 }
 
+var _ backend.ApplyEnvironmenter = &Config{}
+
 // ApplyEnvironment saves values from the environment to the config.
-func ApplyEnvironment(prefix string, cfg interface{}) error {
-	c := cfg.(*Config)
+func (cfg *Config) ApplyEnvironment(prefix string) {
 	for _, val := range []struct {
 		s   *string
 		env string
 	}{
 		// v2/v3 specific
-		{&c.UserName, prefix + "OS_USERNAME"},
-		{&c.APIKey, prefix + "OS_PASSWORD"},
-		{&c.Region, prefix + "OS_REGION_NAME"},
-		{&c.AuthURL, prefix + "OS_AUTH_URL"},
+		{&cfg.UserName, prefix + "OS_USERNAME"},
+		{&cfg.Region, prefix + "OS_REGION_NAME"},
+		{&cfg.AuthURL, prefix + "OS_AUTH_URL"},
 
 		// v3 specific
-		{&c.UserID, prefix + "OS_USER_ID"},
-		{&c.Domain, prefix + "OS_USER_DOMAIN_NAME"},
-		{&c.DomainID, prefix + "OS_USER_DOMAIN_ID"},
-		{&c.Tenant, prefix + "OS_PROJECT_NAME"},
-		{&c.TenantDomain, prefix + "OS_PROJECT_DOMAIN_NAME"},
-		{&c.TenantDomainID, prefix + "OS_PROJECT_DOMAIN_ID"},
-		{&c.TrustID, prefix + "OS_TRUST_ID"},
+		{&cfg.UserID, prefix + "OS_USER_ID"},
+		{&cfg.Domain, prefix + "OS_USER_DOMAIN_NAME"},
+		{&cfg.DomainID, prefix + "OS_USER_DOMAIN_ID"},
+		{&cfg.Tenant, prefix + "OS_PROJECT_NAME"},
+		{&cfg.TenantDomain, prefix + "OS_PROJECT_DOMAIN_NAME"},
+		{&cfg.TenantDomainID, prefix + "OS_PROJECT_DOMAIN_ID"},
+		{&cfg.TrustID, prefix + "OS_TRUST_ID"},
 
 		// v2 specific
-		{&c.TenantID, prefix + "OS_TENANT_ID"},
-		{&c.Tenant, prefix + "OS_TENANT_NAME"},
+		{&cfg.TenantID, prefix + "OS_TENANT_ID"},
+		{&cfg.Tenant, prefix + "OS_TENANT_NAME"},
 
 		// v1 specific
-		{&c.AuthURL, prefix + "ST_AUTH"},
-		{&c.UserName, prefix + "ST_USER"},
-		{&c.APIKey, prefix + "ST_KEY"},
+		{&cfg.AuthURL, prefix + "ST_AUTH"},
+		{&cfg.UserName, prefix + "ST_USER"},
 
 		// Application Credential auth
-		{&c.ApplicationCredentialID, prefix + "OS_APPLICATION_CREDENTIAL_ID"},
-		{&c.ApplicationCredentialName, prefix + "OS_APPLICATION_CREDENTIAL_NAME"},
-		{&c.ApplicationCredentialSecret, prefix + "OS_APPLICATION_CREDENTIAL_SECRET"},
+		{&cfg.ApplicationCredentialID, prefix + "OS_APPLICATION_CREDENTIAL_ID"},
+		{&cfg.ApplicationCredentialName, prefix + "OS_APPLICATION_CREDENTIAL_NAME"},
 
 		// Manual authentication
-		{&c.StorageURL, prefix + "OS_STORAGE_URL"},
-		{&c.AuthToken, prefix + "OS_AUTH_TOKEN"},
+		{&cfg.StorageURL, prefix + "OS_STORAGE_URL"},
 
-		{&c.DefaultContainerPolicy, prefix + "SWIFT_DEFAULT_CONTAINER_POLICY"},
+		{&cfg.DefaultContainerPolicy, prefix + "SWIFT_DEFAULT_CONTAINER_POLICY"},
 	} {
 		if *val.s == "" {
 			*val.s = os.Getenv(val.env)
 		}
 	}
-	return nil
+	for _, val := range []struct {
+		s   *options.SecretString
+		env string
+	}{
+		// v2/v3 specific — password must be set before the v1 fallback (ST_KEY)
+		{&cfg.APIKey, prefix + "OS_PASSWORD"},
+		{&cfg.ApplicationCredentialSecret, prefix + "OS_APPLICATION_CREDENTIAL_SECRET"},
+		{&cfg.AuthToken, prefix + "OS_AUTH_TOKEN"},
+		// v1 specific — only used when OS_PASSWORD is absent
+		{&cfg.APIKey, prefix + "ST_KEY"},
+	} {
+		if val.s.String() == "" {
+			*val.s = options.NewSecretString(os.Getenv(val.env))
+		}
+	}
 }

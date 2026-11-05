@@ -1,11 +1,10 @@
 package progress
 
 import (
-	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/restic/restic/internal/debug"
-	"github.com/restic/restic/internal/ui/signals"
+	"github.com/restic/restic/internal/restic"
 )
 
 // A Func is a callback for a Counter.
@@ -19,110 +18,41 @@ type Func func(value uint64, total uint64, runtime time.Duration, final bool)
 //
 // The Func is also called when SIGUSR1 (or SIGINFO, on BSD) is received.
 type Counter struct {
-	report  Func
-	start   time.Time
-	stopped chan struct{} // Closed by run.
-	stop    chan struct{} // Close to stop run.
-	tick    *time.Ticker
-
-	valueMutex sync.Mutex
-	value      uint64
-	max        uint64
+	Updater
+	value, max atomic.Uint64
 }
 
-// New starts a new Counter.
-func New(interval time.Duration, total uint64, report Func) *Counter {
-	c := &Counter{
-		report:  report,
-		start:   time.Now(),
-		stopped: make(chan struct{}),
-		stop:    make(chan struct{}),
-		max:     total,
-	}
+var _ restic.Counter = (*Counter)(nil)
 
-	if interval > 0 {
-		c.tick = time.NewTicker(interval)
-	}
-
-	go c.run()
+// NewCounter starts a new Counter.
+func NewCounter(interval time.Duration, total uint64, report Func) *Counter {
+	c := new(Counter)
+	c.max.Store(total)
+	c.Updater = *NewUpdater(interval, func(runtime time.Duration, final bool) {
+		v, maxV := c.Get()
+		if report != nil {
+			report(v, maxV, runtime, final)
+		}
+	})
 	return c
 }
 
 // Add v to the Counter. This method is concurrency-safe.
 func (c *Counter) Add(v uint64) {
-	if c == nil {
-		return
-	}
-
-	c.valueMutex.Lock()
-	c.value += v
-	c.valueMutex.Unlock()
+	c.value.Add(v)
 }
 
 // SetMax sets the maximum expected counter value. This method is concurrency-safe.
 func (c *Counter) SetMax(max uint64) {
-	if c == nil {
-		return
-	}
-	c.valueMutex.Lock()
-	c.max = max
-	c.valueMutex.Unlock()
+	c.max.Store(max)
 }
 
-// Done tells a Counter to stop and waits for it to report its final value.
+// Get returns the current value and the maximum of c.
+// This method is concurrency-safe.
+func (c *Counter) Get() (v, max uint64) {
+	return c.value.Load(), c.max.Load()
+}
+
 func (c *Counter) Done() {
-	if c == nil {
-		return
-	}
-	if c.tick != nil {
-		c.tick.Stop()
-	}
-	close(c.stop)
-	<-c.stopped    // Wait for last progress report.
-	*c = Counter{} // Prevent reuse.
-}
-
-// Get the current Counter value. This method is concurrency-safe.
-func (c *Counter) Get() uint64 {
-	c.valueMutex.Lock()
-	v := c.value
-	c.valueMutex.Unlock()
-
-	return v
-}
-
-func (c *Counter) getMax() uint64 {
-	c.valueMutex.Lock()
-	max := c.max
-	c.valueMutex.Unlock()
-
-	return max
-}
-
-func (c *Counter) run() {
-	defer close(c.stopped)
-	defer func() {
-		// Must be a func so that time.Since isn't called at defer time.
-		c.report(c.Get(), c.getMax(), time.Since(c.start), true)
-	}()
-
-	var tick <-chan time.Time
-	if c.tick != nil {
-		tick = c.tick.C
-	}
-	signalsCh := signals.GetProgressChannel()
-	for {
-		var now time.Time
-
-		select {
-		case now = <-tick:
-		case sig := <-signalsCh:
-			debug.Log("Signal received: %v\n", sig)
-			now = time.Now()
-		case <-c.stop:
-			return
-		}
-
-		c.report(c.Get(), c.getMax(), now.Sub(c.start), false)
-	}
+	c.Updater.Done()
 }

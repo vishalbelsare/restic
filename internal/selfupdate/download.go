@@ -39,15 +39,7 @@ func findHash(buf []byte, filename string) (hash []byte, err error) {
 	return nil, fmt.Errorf("hash for file %v not found", filename)
 }
 
-func extractToFile(buf []byte, filename, target string, printf func(string, ...interface{})) error {
-	var mode = os.FileMode(0755)
-
-	// get information about the target file
-	fi, err := os.Lstat(target)
-	if err == nil {
-		mode = fi.Mode()
-	}
-
+func extractToFile(buf []byte, filename, target string, printf func(string, ...any)) error {
 	var rd io.Reader = bytes.NewReader(buf)
 	switch filepath.Ext(filename) {
 	case ".bz2":
@@ -74,41 +66,55 @@ func extractToFile(buf []byte, filename, target string, printf func(string, ...i
 		rd = file
 	}
 
-	err = os.Remove(target)
-	if os.IsNotExist(err) {
-		err = nil
-	}
-	if err != nil {
-		return fmt.Errorf("unable to remove target file: %v", err)
-	}
-
-	dest, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
+	// Write everything to a temp file
+	dir := filepath.Dir(target)
+	newFile, err := os.CreateTemp(dir, "restic")
 	if err != nil {
 		return err
 	}
 
-	n, err := io.Copy(dest, rd)
+	n, err := io.Copy(newFile, rd)
 	if err != nil {
-		_ = dest.Close()
-		_ = os.Remove(dest.Name())
+		_ = newFile.Close()
+		_ = os.Remove(newFile.Name())
+		return err
+	}
+	if err = newFile.Sync(); err != nil {
+		_ = newFile.Close()
+		_ = os.Remove(newFile.Name())
+		return err
+	}
+	if err = newFile.Close(); err != nil {
+		_ = os.Remove(newFile.Name())
 		return err
 	}
 
-	err = dest.Close()
-	if err != nil {
+	mode := os.FileMode(0755)
+	// attempt to find the original mode
+	if fi, err := os.Lstat(target); err == nil {
+		mode = fi.Mode()
+	}
+
+	// Remove the original binary.
+	if err := removeResticBinary(dir, target); err != nil {
 		return err
 	}
 
-	printf("saved %d bytes in %v\n", n, dest.Name())
-	return nil
+	// Rename the temp file to the final location atomically.
+	if err := os.Rename(newFile.Name(), target); err != nil {
+		return err
+	}
+
+	printf("saved %d bytes in %v\n", n, target)
+	return os.Chmod(target, mode)
 }
 
 // DownloadLatestStableRelease downloads the latest stable released version of
 // restic and saves it to target. It returns the version string for the newest
 // version. The function printf is used to print progress information.
-func DownloadLatestStableRelease(ctx context.Context, target, currentVersion string, printf func(string, ...interface{})) (version string, err error) {
+func DownloadLatestStableRelease(ctx context.Context, target, currentVersion string, printf func(string, ...any)) (version string, err error) {
 	if printf == nil {
-		printf = func(string, ...interface{}) {}
+		printf = func(string, ...any) {}
 	}
 
 	printf("find latest release of restic at GitHub\n")

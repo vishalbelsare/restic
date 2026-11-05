@@ -1,72 +1,94 @@
-// +build darwin freebsd linux
+//go:build darwin || freebsd || linux
 
 package fuse
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
+	"syscall"
 
-	"bazil.org/fuse"
-	"bazil.org/fuse/fs"
+	"github.com/anacrolix/fuse"
+	"github.com/anacrolix/fuse/fs"
 
+	"github.com/restic/restic/internal/data"
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/restic"
 )
 
 // Statically ensure that *dir implement those interface
 var _ = fs.HandleReadDirAller(&dir{})
+var _ = fs.NodeForgetter(&dir{})
+var _ = fs.NodeGetxattrer(&dir{})
+var _ = fs.NodeListxattrer(&dir{})
 var _ = fs.NodeStringLookuper(&dir{})
 
 type dir struct {
 	root        *Root
-	items       map[string]*restic.Node
+	forget      forgetFn
+	items       map[string]*data.Node
 	inode       uint64
 	parentInode uint64
-	node        *restic.Node
+	node        *data.Node
 	m           sync.Mutex
+	cache       treeCache
 }
 
 func cleanupNodeName(name string) string {
 	return filepath.Base(name)
 }
 
-func newDir(ctx context.Context, root *Root, inode, parentInode uint64, node *restic.Node) (*dir, error) {
+func newDir(root *Root, forget forgetFn, inode, parentInode uint64, node *data.Node) (*dir, error) {
 	debug.Log("new dir for %v (%v)", node.Name, node.Subtree)
 
 	return &dir{
 		root:        root,
+		forget:      forget,
 		node:        node,
 		inode:       inode,
 		parentInode: parentInode,
+		cache:       *newTreeCache(),
 	}, nil
+}
+
+// returning a wrapped context.Canceled error will instead result in returning
+// an input / output error to the user. Thus unwrap the error to match the
+// expectations of bazil/fuse
+func unwrapCtxCanceled(err error) error {
+	if errors.Is(err, context.Canceled) {
+		return context.Canceled
+	}
+	return err
 }
 
 // replaceSpecialNodes replaces nodes with name "." and "/" by their contents.
 // Otherwise, the node is returned.
-func replaceSpecialNodes(ctx context.Context, repo restic.Repository, node *restic.Node) ([]*restic.Node, error) {
-	if node.Type != "dir" || node.Subtree == nil {
-		return []*restic.Node{node}, nil
+func replaceSpecialNodes(ctx context.Context, repo restic.BlobLoader, node *data.Node) (data.TreeNodeIterator, error) {
+	if node.Type != data.NodeTypeDir || node.Subtree == nil {
+		return slices.Values([]data.NodeOrError{{Node: node}}), nil
 	}
 
 	if node.Name != "." && node.Name != "/" {
-		return []*restic.Node{node}, nil
+		return slices.Values([]data.NodeOrError{{Node: node}}), nil
 	}
 
-	tree, err := repo.LoadTree(ctx, *node.Subtree)
+	tree, err := data.LoadTree(ctx, repo, *node.Subtree)
 	if err != nil {
-		return nil, err
+		return nil, unwrapCtxCanceled(err)
 	}
 
-	return tree.Nodes, nil
+	return tree, nil
 }
 
-func newDirFromSnapshot(ctx context.Context, root *Root, inode uint64, snapshot *restic.Snapshot) (*dir, error) {
+func newDirFromSnapshot(root *Root, forget forgetFn, inode uint64, snapshot *data.Snapshot) (*dir, error) {
 	debug.Log("new dir for snapshot %v (%v)", snapshot.ID(), snapshot.Tree)
 	return &dir{
-		root: root,
-		node: &restic.Node{
+		root:   root,
+		forget: forget,
+		node: &data.Node{
 			AccessTime: snapshot.Time,
 			ModTime:    snapshot.Time,
 			ChangeTime: snapshot.Time,
@@ -74,6 +96,7 @@ func newDirFromSnapshot(ctx context.Context, root *Root, inode uint64, snapshot 
 			Subtree:    snapshot.Tree,
 		},
 		inode: inode,
+		cache: *newTreeCache(),
 	}, nil
 }
 
@@ -87,27 +110,38 @@ func (d *dir) open(ctx context.Context) error {
 
 	debug.Log("open dir %v (%v)", d.node.Name, d.node.Subtree)
 
-	tree, err := d.root.repo.LoadTree(ctx, *d.node.Subtree)
+	tree, err := data.LoadTree(ctx, d.root.repo, *d.node.Subtree)
 	if err != nil {
 		debug.Log("  error loading tree %v: %v", d.node.Subtree, err)
-		return err
+		return unwrapCtxCanceled(err)
 	}
-	items := make(map[string]*restic.Node)
-	for _, n := range tree.Nodes {
+	items := make(map[string]*data.Node)
+	for item := range tree {
+		if item.Error != nil {
+			return unwrapCtxCanceled(item.Error)
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		n := item.Node
+
 		nodes, err := replaceSpecialNodes(ctx, d.root.repo, n)
 		if err != nil {
 			debug.Log("  replaceSpecialNodes(%v) failed: %v", n, err)
 			return err
 		}
-		for _, node := range nodes {
-			items[cleanupNodeName(node.Name)] = node
+		for item := range nodes {
+			if item.Error != nil {
+				return unwrapCtxCanceled(item.Error)
+			}
+			items[cleanupNodeName(item.Node.Name)] = item.Node
 		}
 	}
 	d.items = items
 	return nil
 }
 
-func (d *dir) Attr(ctx context.Context, a *fuse.Attr) error {
+func (d *dir) Attr(_ context.Context, a *fuse.Attr) error {
 	debug.Log("Attr()")
 	a.Inode = d.inode
 	a.Mode = os.ModeDir | d.node.Mode
@@ -130,7 +164,7 @@ func (d *dir) calcNumberOfLinks() uint32 {
 	// of directories contained by d
 	count := uint32(2)
 	for _, node := range d.items {
-		if node.Type == "dir" {
+		if node.Type == data.NodeTypeDir {
 			count++
 		}
 	}
@@ -158,19 +192,23 @@ func (d *dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	})
 
 	for _, node := range d.items {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
 		name := cleanupNodeName(node.Name)
 		var typ fuse.DirentType
 		switch node.Type {
-		case "dir":
+		case data.NodeTypeDir:
 			typ = fuse.DT_Dir
-		case "file":
+		case data.NodeTypeFile:
 			typ = fuse.DT_File
-		case "symlink":
+		case data.NodeTypeSymlink:
 			typ = fuse.DT_Link
 		}
 
 		ret = append(ret, fuse.Dirent{
-			Inode: fs.GenerateDynamicInode(d.inode, name),
+			Inode: inodeFromNode(d.inode, node),
 			Type:  typ,
 			Name:  name,
 		})
@@ -187,40 +225,38 @@ func (d *dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 		return nil, err
 	}
 
-	node, ok := d.items[name]
-	if !ok {
-		debug.Log("  Lookup(%v) -> not found", name)
-		return nil, fuse.ENOENT
-	}
-	switch node.Type {
-	case "dir":
-		return newDir(ctx, d.root, fs.GenerateDynamicInode(d.inode, name), d.inode, node)
-	case "file":
-		return newFile(ctx, d.root, fs.GenerateDynamicInode(d.inode, name), node)
-	case "symlink":
-		return newLink(ctx, d.root, fs.GenerateDynamicInode(d.inode, name), node)
-	case "dev", "chardev", "fifo", "socket":
-		return newOther(ctx, d.root, fs.GenerateDynamicInode(d.inode, name), node)
-	default:
-		debug.Log("  node %v has unknown type %v", name, node.Type)
-		return nil, fuse.ENOENT
-	}
+	return d.cache.lookupOrCreate(name, -1, func(forget forgetFn) (fs.Node, error) {
+		node, ok := d.items[name]
+		if !ok {
+			debug.Log("  Lookup(%v) -> not found", name)
+			return nil, syscall.ENOENT
+		}
+		inode := inodeFromNode(d.inode, node)
+		switch node.Type {
+		case data.NodeTypeDir:
+			return newDir(d.root, forget, inode, d.inode, node)
+		case data.NodeTypeFile:
+			return newFile(d.root, forget, inode, node)
+		case data.NodeTypeSymlink:
+			return newLink(d.root, forget, inode, node)
+		case data.NodeTypeDev, data.NodeTypeCharDev, data.NodeTypeFifo, data.NodeTypeSocket:
+			return newOther(d.root, forget, inode, node)
+		default:
+			debug.Log("  node %v has unknown type %v", name, node.Type)
+			return nil, syscall.ENOENT
+		}
+	})
 }
 
-func (d *dir) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, resp *fuse.ListxattrResponse) error {
-	debug.Log("Listxattr(%v, %v)", d.node.Name, req.Size)
-	for _, attr := range d.node.ExtendedAttributes {
-		resp.Append(attr.Name)
-	}
+func (d *dir) Listxattr(_ context.Context, req *fuse.ListxattrRequest, resp *fuse.ListxattrResponse) error {
+	nodeToXattrList(d.node, req, resp)
 	return nil
 }
 
-func (d *dir) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) error {
-	debug.Log("Getxattr(%v, %v, %v)", d.node.Name, req.Name, req.Size)
-	attrval := d.node.GetExtendedAttribute(req.Name)
-	if attrval != nil {
-		resp.Xattr = attrval
-		return nil
-	}
-	return fuse.ErrNoXattr
+func (d *dir) Getxattr(_ context.Context, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) error {
+	return nodeGetXattr(d.node, req, resp)
+}
+
+func (d *dir) Forget() {
+	d.forget()
 }

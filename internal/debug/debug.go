@@ -1,5 +1,3 @@
-// +build debug
-
 package debug
 
 import (
@@ -10,8 +8,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-
-	"github.com/restic/restic/internal/fs"
 )
 
 var opts struct {
@@ -48,7 +44,7 @@ func initDebugLogger() {
 
 	fmt.Fprintf(os.Stderr, "debug log file %v\n", debugfile)
 
-	f, err := fs.OpenFile(debugfile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	f, err := os.OpenFile(debugfile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "unable to open debug log file: %v\n", err)
 		os.Exit(2)
@@ -65,13 +61,14 @@ func parseFilter(envname string, pad func(string) string) map[string]bool {
 		return filter
 	}
 
-	for _, fn := range strings.Split(env, ",") {
+	for fn := range strings.SplitSeq(env, ",") {
 		t := pad(strings.TrimSpace(fn))
 		val := true
-		if t[0] == '-' {
+		switch t[0] {
+		case '-':
 			val = false
 			t = t[1:]
-		} else if t[0] == '+' {
+		case '+':
 			val = true
 			t = t[1:]
 		}
@@ -124,7 +121,7 @@ func goroutineNum() int {
 	runtime.Stack(b, false)
 	var num int
 
-	fmt.Sscanf(string(b), "goroutine %d ", &num)
+	_, _ = fmt.Sscanf(string(b), "goroutine %d ", &num)
 	return num
 }
 
@@ -164,7 +161,7 @@ func checkFilter(filter map[string]bool, key string) bool {
 }
 
 // Log prints a message to the debug log (if debug is enabled).
-func Log(f string, args ...interface{}) {
+func Log(f string, args ...any) {
 	if !opts.isEnabled {
 		return
 	}

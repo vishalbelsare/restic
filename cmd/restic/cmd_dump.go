@@ -7,55 +7,69 @@ import (
 	"path"
 	"path/filepath"
 
+	"github.com/restic/restic/internal/data"
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/dump"
 	"github.com/restic/restic/internal/errors"
+	"github.com/restic/restic/internal/global"
 	"github.com/restic/restic/internal/restic"
+	"github.com/restic/restic/internal/ui"
+	"github.com/restic/restic/internal/ui/progress"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
-var cmdDump = &cobra.Command{
-	Use:   "dump [flags] snapshotID file",
-	Short: "Print a backed-up file to stdout",
-	Long: `
+func newDumpCommand(globalOptions *global.Options) *cobra.Command {
+	var opts DumpOptions
+	cmd := &cobra.Command{
+		Use:   "dump [flags] snapshotID file",
+		Short: "Print backed-up files or folders to stdout",
+		Long: `
 The "dump" command extracts files from a snapshot from the repository. If a
 single file is selected, it prints its contents to stdout. Folders are output
 as a tar (default) or zip file containing the contents of the specified folder.
 Pass "/" as file name to dump the whole snapshot as an archive file.
 
-The special snapshot "latest" can be used to use the latest snapshot in the
+The special snapshotID "latest" can be used to use the latest snapshot in the
 repository.
+
+To include the folder content at the root of the archive, you can use the
+"snapshotID:subfolder" syntax, where "subfolder" is a path within the
+snapshot tree as shown by "restic ls".
 
 EXIT STATUS
 ===========
 
-Exit status is 0 if the command was successful, and non-zero if there was any error.
+Exit status is 0 if the command was successful.
+Exit status is 1 if there was any error.
+Exit status is 10 if the repository does not exist.
+Exit status is 11 if the repository is already locked.
+Exit status is 12 if the password is incorrect.
 `,
-	DisableAutoGenTag: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return runDump(dumpOptions, globalOptions, args)
-	},
+		GroupID:           cmdGroupDefault,
+		DisableAutoGenTag: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			finalizeSnapshotFilter(&opts.SnapshotFilter)
+			return runDump(cmd.Context(), opts, *globalOptions, args, globalOptions.Term)
+		},
+	}
+
+	opts.AddFlags(cmd.Flags())
+	return cmd
 }
 
 // DumpOptions collects all options for the dump command.
 type DumpOptions struct {
-	Hosts   []string
-	Paths   []string
-	Tags    restic.TagLists
+	data.SnapshotFilter
 	Archive string
+	Target  string
 }
 
-var dumpOptions DumpOptions
-
-func init() {
-	cmdRoot.AddCommand(cmdDump)
-
-	flags := cmdDump.Flags()
-	flags.StringArrayVarP(&dumpOptions.Hosts, "host", "H", nil, `only consider snapshots for this host when the snapshot ID is "latest" (can be specified multiple times)`)
-	flags.Var(&dumpOptions.Tags, "tag", "only consider snapshots which include this `taglist` for snapshot ID \"latest\"")
-	flags.StringArrayVar(&dumpOptions.Paths, "path", nil, "only consider snapshots which include this (absolute) `path` for snapshot ID \"latest\"")
-	flags.StringVarP(&dumpOptions.Archive, "archive", "a", "tar", "set archive `format` as \"tar\" or \"zip\"")
+func (opts *DumpOptions) AddFlags(f *pflag.FlagSet) {
+	initSingleSnapshotFilter(f, &opts.SnapshotFilter)
+	f.StringVarP(&opts.Archive, "archive", "a", "tar", "set archive `format` as \"tar\" or \"zip\"")
+	f.StringVarP(&opts.Target, "target", "t", "", "write the output to target `path`")
 }
 
 func splitPath(p string) []string {
@@ -67,11 +81,11 @@ func splitPath(p string) []string {
 	return append(s, f)
 }
 
-func printFromTree(ctx context.Context, tree *restic.Tree, repo restic.Repository, prefix string, pathComponents []string, d *dump.Dumper) error {
+func printFromTree(ctx context.Context, tree data.TreeNodeIterator, repo restic.BlobLoader, prefix string, pathComponents []string, d *dump.Dumper, canWriteArchiveFunc func() error) error {
 	// If we print / we need to assume that there are multiple nodes at that
 	// level in the tree.
 	if pathComponents[0] == "" {
-		if err := checkStdoutArchive(); err != nil {
+		if err := canWriteArchiveFunc(); err != nil {
 			return err
 		}
 		return d.DumpTree(ctx, tree, "/")
@@ -79,31 +93,38 @@ func printFromTree(ctx context.Context, tree *restic.Tree, repo restic.Repositor
 
 	item := filepath.Join(prefix, pathComponents[0])
 	l := len(pathComponents)
-	for _, node := range tree.Nodes {
+	for it := range tree {
+		if it.Error != nil {
+			return it.Error
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		node := it.Node
 		// If dumping something in the highest level it will just take the
 		// first item it finds and dump that according to the switch case below.
 		if node.Name == pathComponents[0] {
 			switch {
-			case l == 1 && dump.IsFile(node):
+			case l == 1 && node.Type == data.NodeTypeFile:
 				return d.WriteNode(ctx, node)
-			case l > 1 && dump.IsDir(node):
-				subtree, err := repo.LoadTree(ctx, *node.Subtree)
+			case l > 1 && node.Type == data.NodeTypeDir:
+				subtree, err := data.LoadTree(ctx, repo, *node.Subtree)
 				if err != nil {
 					return errors.Wrapf(err, "cannot load subtree for %q", item)
 				}
-				return printFromTree(ctx, subtree, repo, item, pathComponents[1:], d)
-			case dump.IsDir(node):
-				if err := checkStdoutArchive(); err != nil {
+				return printFromTree(ctx, subtree, repo, item, pathComponents[1:], d, canWriteArchiveFunc)
+			case node.Type == data.NodeTypeDir:
+				if err := canWriteArchiveFunc(); err != nil {
 					return err
 				}
-				subtree, err := repo.LoadTree(ctx, *node.Subtree)
+				subtree, err := data.LoadTree(ctx, repo, *node.Subtree)
 				if err != nil {
 					return err
 				}
 				return d.DumpTree(ctx, subtree, item)
 			case l > 1:
 				return fmt.Errorf("%q should be a dir, but is a %q", item, node.Type)
-			case !dump.IsFile(node):
+			case node.Type != data.NodeTypeFile:
 				return fmt.Errorf("%q should be a file, but is a %q", item, node.Type)
 			}
 		}
@@ -111,12 +132,12 @@ func printFromTree(ctx context.Context, tree *restic.Tree, repo restic.Repositor
 	return fmt.Errorf("path %q not found in snapshot", item)
 }
 
-func runDump(opts DumpOptions, gopts GlobalOptions, args []string) error {
-	ctx := gopts.ctx
-
+func runDump(ctx context.Context, opts DumpOptions, gopts global.Options, args []string, term ui.Terminal) error {
 	if len(args) != 2 {
 		return errors.Fatal("no file and no snapshot ID specified")
 	}
+
+	printer := progress.NewTerminalPrinter(gopts.JSON, gopts.Verbosity, term)
 
 	switch opts.Archive {
 	case "tar", "zip":
@@ -131,60 +152,60 @@ func runDump(opts DumpOptions, gopts GlobalOptions, args []string) error {
 
 	splittedPath := splitPath(path.Clean(pathToPrint))
 
-	repo, err := OpenRepository(gopts)
+	ctx, repo, unlock, err := openWithReadLock(ctx, gopts, gopts.NoLock, printer)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	sn, subfolder, err := opts.SnapshotFilter.FindLatest(ctx, repo, repo, snapshotIDString)
+	if err != nil {
+		return errors.Fatalf("failed to find snapshot: %v", err)
+	}
+
+	err = repo.LoadIndex(ctx, printer)
 	if err != nil {
 		return err
 	}
 
-	if !gopts.NoLock {
-		lock, err := lockRepo(ctx, repo)
-		defer unlockRepo(lock)
-		if err != nil {
-			return err
-		}
-	}
-
-	err = repo.LoadIndex(ctx)
+	sn.Tree, err = data.FindTreeDirectory(ctx, repo, sn.Tree, subfolder)
 	if err != nil {
 		return err
 	}
 
-	var id restic.ID
+	tree, err := data.LoadTree(ctx, repo, *sn.Tree)
+	if err != nil {
+		return errors.Fatalf("loading tree for snapshot %q failed: %v", snapshotIDString, err)
+	}
 
-	if snapshotIDString == "latest" {
-		id, err = restic.FindLatestSnapshot(ctx, repo, opts.Paths, opts.Tags, opts.Hosts, nil)
+	outputFileWriter := term.OutputRaw()
+	canWriteArchiveFunc := checkStdoutArchive(term)
+
+	if opts.Target != "" {
+		file, err := os.Create(opts.Target)
 		if err != nil {
-			Exitf(1, "latest snapshot for criteria not found: %v Paths:%v Hosts:%v", err, opts.Paths, opts.Hosts)
+			return fmt.Errorf("cannot dump to file: %w", err)
 		}
-	} else {
-		id, err = restic.FindSnapshot(ctx, repo, snapshotIDString)
-		if err != nil {
-			Exitf(1, "invalid id %q: %v", snapshotIDString, err)
-		}
+		defer func() {
+			_ = file.Close()
+		}()
+
+		outputFileWriter = file
+		canWriteArchiveFunc = func() error { return nil }
 	}
 
-	sn, err := restic.LoadSnapshot(gopts.ctx, repo, id)
+	d := dump.New(opts.Archive, repo, outputFileWriter)
+	err = printFromTree(ctx, tree, repo, "/", splittedPath, d, canWriteArchiveFunc)
 	if err != nil {
-		Exitf(2, "loading snapshot %q failed: %v", snapshotIDString, err)
-	}
-
-	tree, err := repo.LoadTree(ctx, *sn.Tree)
-	if err != nil {
-		Exitf(2, "loading tree for snapshot %q failed: %v", snapshotIDString, err)
-	}
-
-	d := dump.New(opts.Archive, repo, os.Stdout)
-	err = printFromTree(ctx, tree, repo, "/", splittedPath, d)
-	if err != nil {
-		Exitf(2, "cannot dump file: %v", err)
+		return errors.Fatalf("cannot dump file: %v", err)
 	}
 
 	return nil
 }
 
-func checkStdoutArchive() error {
-	if stdoutIsTerminal() {
-		return fmt.Errorf("stdout is the terminal, please redirect output")
+func checkStdoutArchive(term ui.Terminal) func() error {
+	if term.OutputIsTerminal() {
+		return func() error { return fmt.Errorf("stdout is the terminal, please redirect output") }
 	}
-	return nil
+	return func() error { return nil }
 }

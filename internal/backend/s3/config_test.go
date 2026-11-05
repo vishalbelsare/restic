@@ -1,113 +1,132 @@
 package s3
 
-import "testing"
+import (
+	"strings"
+	"testing"
+	"time"
 
-var configTests = []struct {
-	s   string
-	cfg Config
-}{
-	{"s3://eu-central-1/bucketname", Config{
-		Endpoint:    "eu-central-1",
-		Bucket:      "bucketname",
-		Prefix:      "",
-		Connections: 5,
-	}},
-	{"s3://eu-central-1/bucketname/", Config{
-		Endpoint:    "eu-central-1",
-		Bucket:      "bucketname",
-		Prefix:      "",
-		Connections: 5,
-	}},
-	{"s3://eu-central-1/bucketname/prefix/directory", Config{
-		Endpoint:    "eu-central-1",
-		Bucket:      "bucketname",
-		Prefix:      "prefix/directory",
-		Connections: 5,
-	}},
-	{"s3://eu-central-1/bucketname/prefix/directory/", Config{
-		Endpoint:    "eu-central-1",
-		Bucket:      "bucketname",
-		Prefix:      "prefix/directory",
-		Connections: 5,
-	}},
-	{"s3:eu-central-1/foobar", Config{
-		Endpoint:    "eu-central-1",
-		Bucket:      "foobar",
-		Prefix:      "",
-		Connections: 5,
-	}},
-	{"s3:eu-central-1/foobar/", Config{
-		Endpoint:    "eu-central-1",
-		Bucket:      "foobar",
-		Prefix:      "",
-		Connections: 5,
-	}},
-	{"s3:eu-central-1/foobar/prefix/directory", Config{
-		Endpoint:    "eu-central-1",
-		Bucket:      "foobar",
-		Prefix:      "prefix/directory",
-		Connections: 5,
-	}},
-	{"s3:eu-central-1/foobar/prefix/directory/", Config{
-		Endpoint:    "eu-central-1",
-		Bucket:      "foobar",
-		Prefix:      "prefix/directory",
-		Connections: 5,
-	}},
-	{"s3:https://hostname:9999/foobar", Config{
-		Endpoint:    "hostname:9999",
-		Bucket:      "foobar",
-		Prefix:      "",
-		Connections: 5,
-	}},
-	{"s3:https://hostname:9999/foobar/", Config{
-		Endpoint:    "hostname:9999",
-		Bucket:      "foobar",
-		Prefix:      "",
-		Connections: 5,
-	}},
-	{"s3:http://hostname:9999/foobar", Config{
-		Endpoint:    "hostname:9999",
-		Bucket:      "foobar",
-		Prefix:      "",
-		UseHTTP:     true,
-		Connections: 5,
-	}},
-	{"s3:http://hostname:9999/foobar/", Config{
-		Endpoint:    "hostname:9999",
-		Bucket:      "foobar",
-		Prefix:      "",
-		UseHTTP:     true,
-		Connections: 5,
-	}},
-	{"s3:http://hostname:9999/bucket/prefix/directory", Config{
-		Endpoint:    "hostname:9999",
-		Bucket:      "bucket",
-		Prefix:      "prefix/directory",
-		UseHTTP:     true,
-		Connections: 5,
-	}},
-	{"s3:http://hostname:9999/bucket/prefix/directory/", Config{
-		Endpoint:    "hostname:9999",
-		Bucket:      "bucket",
-		Prefix:      "prefix/directory",
-		UseHTTP:     true,
-		Connections: 5,
-	}},
+	"github.com/restic/restic/internal/backend/test"
+)
+
+func newTestConfig(cfg Config) Config {
+	if cfg.Connections == 0 {
+		cfg.Connections = 5
+	}
+	if cfg.RestoreDays == 0 {
+		cfg.RestoreDays = 7
+	}
+	if cfg.RestoreTimeout == 0 {
+		cfg.RestoreTimeout = 24 * time.Hour
+	}
+	if cfg.RestoreTier == "" {
+		cfg.RestoreTier = "Standard"
+	}
+	return cfg
+}
+
+var configTests = []test.ConfigTestData[Config]{
+	{S: "s3://eu-central-1/bucketname", Cfg: newTestConfig(Config{
+		Endpoint: "eu-central-1",
+		Bucket:   "bucketname",
+		Prefix:   "",
+	})},
+	{S: "s3://eu-central-1/bucketname/", Cfg: newTestConfig(Config{
+		Endpoint: "eu-central-1",
+		Bucket:   "bucketname",
+		Prefix:   "",
+	})},
+	{S: "s3://eu-central-1/bucketname/prefix/directory", Cfg: newTestConfig(Config{
+		Endpoint: "eu-central-1",
+		Bucket:   "bucketname",
+		Prefix:   "prefix/directory",
+	})},
+	{S: "s3://eu-central-1/bucketname/prefix/directory/", Cfg: newTestConfig(Config{
+		Endpoint: "eu-central-1",
+		Bucket:   "bucketname",
+		Prefix:   "prefix/directory",
+	})},
+	{S: "s3:eu-central-1/foobar", Cfg: newTestConfig(Config{
+		Endpoint: "eu-central-1",
+		Bucket:   "foobar",
+		Prefix:   "",
+	})},
+	{S: "s3:eu-central-1/foobar/", Cfg: newTestConfig(Config{
+		Endpoint: "eu-central-1",
+		Bucket:   "foobar",
+		Prefix:   "",
+	})},
+	{S: "s3:eu-central-1/foobar/prefix/directory", Cfg: newTestConfig(Config{
+		Endpoint: "eu-central-1",
+		Bucket:   "foobar",
+		Prefix:   "prefix/directory",
+	})},
+	{S: "s3:eu-central-1/foobar/prefix/directory/", Cfg: newTestConfig(Config{
+		Endpoint: "eu-central-1",
+		Bucket:   "foobar",
+		Prefix:   "prefix/directory",
+	})},
+	{S: "s3:hostname.foo/foobar", Cfg: newTestConfig(Config{
+		Endpoint: "hostname.foo",
+		Bucket:   "foobar",
+		Prefix:   "",
+	})},
+	{S: "s3:hostname.foo/foobar/prefix/directory", Cfg: newTestConfig(Config{
+		Endpoint: "hostname.foo",
+		Bucket:   "foobar",
+		Prefix:   "prefix/directory",
+	})},
+	{S: "s3:https://hostname/foobar", Cfg: newTestConfig(Config{
+		Endpoint: "hostname",
+		Bucket:   "foobar",
+		Prefix:   "",
+	})},
+	{S: "s3:https://hostname:9999/foobar", Cfg: newTestConfig(Config{
+		Endpoint: "hostname:9999",
+		Bucket:   "foobar",
+		Prefix:   "",
+	})},
+	{S: "s3:https://hostname:9999/foobar/", Cfg: newTestConfig(Config{
+		Endpoint: "hostname:9999",
+		Bucket:   "foobar",
+		Prefix:   "",
+	})},
+	{S: "s3:http://hostname:9999/foobar", Cfg: newTestConfig(Config{
+		Endpoint: "hostname:9999",
+		Bucket:   "foobar",
+		Prefix:   "",
+		UseHTTP:  true,
+	})},
+	{S: "s3:http://hostname:9999/foobar/", Cfg: newTestConfig(Config{
+		Endpoint: "hostname:9999",
+		Bucket:   "foobar",
+		Prefix:   "",
+		UseHTTP:  true,
+	})},
+	{S: "s3:http://hostname:9999/bucket/prefix/directory", Cfg: newTestConfig(Config{
+		Endpoint: "hostname:9999",
+		Bucket:   "bucket",
+		Prefix:   "prefix/directory",
+		UseHTTP:  true,
+	})},
+	{S: "s3:http://hostname:9999/bucket/prefix/directory/", Cfg: newTestConfig(Config{
+		Endpoint: "hostname:9999",
+		Bucket:   "bucket",
+		Prefix:   "prefix/directory",
+		UseHTTP:  true,
+	})},
 }
 
 func TestParseConfig(t *testing.T) {
-	for i, test := range configTests {
-		cfg, err := ParseConfig(test.s)
-		if err != nil {
-			t.Errorf("test %d:%s failed: %v", i, test.s, err)
-			continue
-		}
+	test.ParseConfigTester(t, ParseConfig, configTests)
+}
 
-		if cfg != test.cfg {
-			t.Errorf("test %d:\ninput:\n  %s\n wrong config, want:\n  %v\ngot:\n  %v",
-				i, test.s, test.cfg, cfg)
-			continue
+func TestParseError(t *testing.T) {
+	const prefix = "s3: invalid format,"
+
+	for _, s := range []string{"", "/", "//", "/bucket/prefix"} {
+		_, err := ParseConfig("s3://" + s)
+		if err == nil || !strings.HasPrefix(err.Error(), prefix) {
+			t.Errorf("expected %q, got %q", prefix, err)
 		}
 	}
 }

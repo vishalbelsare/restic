@@ -1,24 +1,24 @@
-//+build !windows
+//go:build !windows
 
 package restorer
 
 import (
 	"context"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/restic/restic/internal/repository"
-	"github.com/restic/restic/internal/restic"
 	rtest "github.com/restic/restic/internal/test"
 )
 
-func TestRestorerRestoreEmptyHardlinkedFileds(t *testing.T) {
-	repo, cleanup := repository.TestRepository(t)
-	defer cleanup()
+func TestRestorerRestoreEmptyHardlinkedFields(t *testing.T) {
+	repo := repository.TestRepository(t)
 
-	_, id := saveSnapshot(t, repo, Snapshot{
+	sn, _ := saveSnapshot(t, repo, Snapshot{
 		Nodes: map[string]Node{
 			"dirtest": Dir{
 				Nodes: map[string]Node{
@@ -27,22 +27,14 @@ func TestRestorerRestoreEmptyHardlinkedFileds(t *testing.T) {
 				},
 			},
 		},
-	})
+	}, noopGetGenericAttributes)
 
-	res, err := NewRestorer(context.TODO(), repo, id)
-	rtest.OK(t, err)
+	res := NewRestorer(repo, sn, Options{})
 
-	res.SelectFilter = func(item string, dstpath string, node *restic.Node) (selectedForRestore bool, childMayBeSelected bool) {
-		return true, true
-	}
+	tempdir := rtest.TempDir(t)
+	ctx := t.Context()
 
-	tempdir, cleanup := rtest.TempDir(t)
-	defer cleanup()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	err = res.RestoreTo(ctx, tempdir)
+	_, err := res.RestoreTo(ctx, tempdir)
 	rtest.OK(t, err)
 
 	f1, err := os.Stat(filepath.Join(tempdir, "dirtest/file1"))
@@ -57,5 +49,90 @@ func TestRestorerRestoreEmptyHardlinkedFileds(t *testing.T) {
 
 	if ok1 && ok2 {
 		rtest.Equals(t, s1.Ino, s2.Ino)
+	}
+}
+
+func getBlockCount(t *testing.T, filename string) int64 {
+	fi, err := os.Stat(filename)
+	rtest.OK(t, err)
+	st := fi.Sys().(*syscall.Stat_t)
+	if st == nil {
+		return -1
+	}
+	return st.Blocks
+}
+
+func TestRestorerProgressBar(t *testing.T) {
+	testRestorerProgressBar(t, false)
+}
+
+func TestRestorerProgressBarDryRun(t *testing.T) {
+	testRestorerProgressBar(t, true)
+}
+
+func testRestorerProgressBar(t *testing.T, dryRun bool) {
+	repo := repository.TestRepository(t)
+
+	sn, _ := saveSnapshot(t, repo, Snapshot{
+		Nodes: map[string]Node{
+			"dirtest": Dir{
+				Nodes: map[string]Node{
+					"file1": File{Links: 2, Inode: 1, Data: "foo"},
+					"file2": File{Links: 2, Inode: 1, Data: "foo"},
+				},
+			},
+			"file2": File{Links: 1, Inode: 2, Data: "example"},
+		},
+	}, noopGetGenericAttributes)
+
+	progress := newTestProgress()
+	res := NewRestorer(repo, sn, Options{Progress: progress, DryRun: dryRun})
+
+	tempdir := rtest.TempDir(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	_, err := res.RestoreTo(ctx, tempdir)
+	rtest.OK(t, err)
+
+	rtest.Equals(t, progressState{
+		FilesFinished:   4,
+		FilesTotal:      4,
+		FilesSkipped:    0,
+		AllBytesWritten: 10,
+		AllBytesTotal:   10,
+		AllBytesSkipped: 0,
+	}, progress.state())
+}
+
+func TestRestorePermissions(t *testing.T) {
+	snapshot := Snapshot{
+		Nodes: map[string]Node{
+			"foo": File{Data: "content: foo\n", Mode: 0o600, ModTime: time.Now()},
+		},
+	}
+
+	repo := repository.TestRepository(t)
+	tempdir := filepath.Join(rtest.TempDir(t), "target")
+	ctx := t.Context()
+
+	sn, id := saveSnapshot(t, repo, snapshot, noopGetGenericAttributes)
+	t.Logf("snapshot saved as %v", id.Str())
+
+	res := NewRestorer(repo, sn, Options{})
+	_, err := res.RestoreTo(ctx, tempdir)
+	rtest.OK(t, err)
+
+	for _, overwrite := range []OverwriteBehavior{OverwriteIfChanged, OverwriteAlways} {
+		// tamper with permissions
+		path := filepath.Join(tempdir, "foo")
+		rtest.OK(t, os.Chmod(path, 0o700))
+
+		res = NewRestorer(repo, sn, Options{Overwrite: overwrite})
+		_, err := res.RestoreTo(ctx, tempdir)
+		rtest.OK(t, err)
+		fi, err := os.Stat(path)
+		rtest.OK(t, err)
+		rtest.Equals(t, fs.FileMode(0o600), fi.Mode().Perm(), "unexpected permissions")
 	}
 }

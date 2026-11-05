@@ -1,6 +1,10 @@
 package restic
 
-import "sort"
+import (
+	"fmt"
+	"sort"
+	"strings"
+)
 
 // BlobSet is a set of blobs.
 type BlobSet map[BlobHandle]struct{}
@@ -29,6 +33,10 @@ func (s BlobSet) Insert(h BlobHandle) {
 // Delete removes id from the set.
 func (s BlobSet) Delete(h BlobHandle) {
 	delete(s, h)
+}
+
+func (s BlobSet) Len() int {
+	return len(s)
 }
 
 // Equals returns true iff s equals other.
@@ -99,11 +107,27 @@ func (s BlobSet) List() BlobHandles {
 	return list
 }
 
+// String produces a human-readable representation of ids.
+// It is meant for producing error messages,
+// so it only returns a summary if ids is long.
 func (s BlobSet) String() string {
-	str := s.List().String()
-	if len(str) < 2 {
-		return "{}"
-	}
+	const maxelems = 10
 
-	return "{" + str[1:len(str)-1] + "}"
+	sb := new(strings.Builder)
+	sb.WriteByte('{')
+	n := 0
+	for k := range s {
+		if n != 0 {
+			sb.WriteByte(' ')
+		}
+		sb.WriteString(k.String())
+
+		if n++; n == maxelems {
+			fmt.Fprintf(sb, " (%d more)", len(s)-n-1)
+			break
+		}
+	}
+	sb.WriteByte('}')
+
+	return sb.String()
 }

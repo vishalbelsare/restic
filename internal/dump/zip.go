@@ -5,11 +5,11 @@ import (
 	"context"
 	"path/filepath"
 
+	"github.com/restic/restic/internal/data"
 	"github.com/restic/restic/internal/errors"
-	"github.com/restic/restic/internal/restic"
 )
 
-func (d *Dumper) dumpZip(ctx context.Context, ch <-chan *restic.Node) (err error) {
+func (d *Dumper) dumpZip(ctx context.Context, ch <-chan *data.Node) (err error) {
 	w := zip.NewWriter(d.w)
 
 	defer func() {
@@ -27,7 +27,7 @@ func (d *Dumper) dumpZip(ctx context.Context, ch <-chan *restic.Node) (err error
 	return nil
 }
 
-func (d *Dumper) dumpNodeZip(ctx context.Context, node *restic.Node, zw *zip.Writer) error {
+func (d *Dumper) dumpNodeZip(ctx context.Context, node *data.Node, zw *zip.Writer) error {
 	relPath, err := filepath.Rel("/", node.Path)
 	if err != nil {
 		return err
@@ -39,8 +39,11 @@ func (d *Dumper) dumpNodeZip(ctx context.Context, node *restic.Node, zw *zip.Wri
 		Modified:           node.ModTime,
 	}
 	header.SetMode(node.Mode)
+	if node.Type == data.NodeTypeFile {
+		header.Method = zip.Deflate
+	}
 
-	if IsDir(node) {
+	if node.Type == data.NodeTypeDir {
 		header.Name += "/"
 	}
 
@@ -49,7 +52,7 @@ func (d *Dumper) dumpNodeZip(ctx context.Context, node *restic.Node, zw *zip.Wri
 		return errors.Wrap(err, "ZipHeader")
 	}
 
-	if IsLink(node) {
+	if node.Type == data.NodeTypeSymlink {
 		if _, err = w.Write([]byte(node.LinkTarget)); err != nil {
 			return errors.Wrap(err, "Write")
 		}

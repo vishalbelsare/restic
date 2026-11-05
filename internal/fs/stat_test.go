@@ -1,19 +1,17 @@
 package fs
 
 import (
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"testing"
 
-	restictest "github.com/restic/restic/internal/test"
+	rtest "github.com/restic/restic/internal/test"
 )
 
 func TestExtendedStat(t *testing.T) {
-	tempdir, cleanup := restictest.TempDir(t)
-	defer cleanup()
-
+	tempdir := rtest.TempDir(t)
 	filename := filepath.Join(tempdir, "file")
-	err := ioutil.WriteFile(filename, []byte("foobar"), 0640)
+	err := os.WriteFile(filename, []byte("foobar"), 0640)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -28,4 +26,15 @@ func TestExtendedStat(t *testing.T) {
 	if !extFI.ModTime.Equal(fi.ModTime()) {
 		t.Errorf("extFI.ModTime does not match, want %v, got %v", fi.ModTime(), extFI.ModTime)
 	}
+}
+
+func TestNilExtendPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			rtest.Assert(t, r == "os.FileInfo is nil", "Panic message does not match, want %v, got %v", "os.FileInfo is nil", r)
+		} else {
+			rtest.Assert(t, false, "Expected panic, but no panic occurred")
+		}
+	}()
+	_ = ExtendedStat(nil)
 }

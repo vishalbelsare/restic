@@ -1,6 +1,9 @@
 package restic
 
-import "sort"
+import (
+	"maps"
+	"sort"
+)
 
 // IDSet is a set of IDs.
 type IDSet map[ID]struct{}
@@ -31,7 +34,7 @@ func (s IDSet) Delete(id ID) {
 	delete(s, id)
 }
 
-// List returns a slice of all IDs in the set.
+// List returns a sorted slice of all IDs in the set.
 func (s IDSet) List() IDs {
 	list := make(IDs, 0, len(s))
 	for id := range s {
@@ -44,28 +47,10 @@ func (s IDSet) List() IDs {
 }
 
 // Equals returns true iff s equals other.
-func (s IDSet) Equals(other IDSet) bool {
-	if len(s) != len(other) {
-		return false
-	}
-
-	for id := range s {
-		if _, ok := other[id]; !ok {
-			return false
-		}
-	}
-
-	// length + one-way comparison is sufficient implication of equality
-
-	return true
-}
+func (s IDSet) Equals(other IDSet) bool { return maps.Equal(s, other) }
 
 // Merge adds the blobs in other to the current set.
-func (s IDSet) Merge(other IDSet) {
-	for id := range other {
-		s.Insert(id)
-	}
-}
+func (s IDSet) Merge(other IDSet) { maps.Copy(s, other) }
 
 // Intersect returns a new set containing the IDs that are present in both sets.
 func (s IDSet) Intersect(other IDSet) (result IDSet) {
@@ -103,9 +88,7 @@ func (s IDSet) Sub(other IDSet) (result IDSet) {
 
 func (s IDSet) String() string {
 	str := s.List().String()
-	if len(str) < 2 {
-		return "{}"
-	}
-
 	return "{" + str[1:len(str)-1] + "}"
 }
+
+func (s IDSet) Clone() IDSet { return maps.Clone(s) }

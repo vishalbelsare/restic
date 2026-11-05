@@ -1,104 +1,165 @@
 package rest_test
 
 import (
+	"bufio"
 	"context"
-	"net"
+	"fmt"
 	"net/url"
 	"os"
 	"os/exec"
+	"regexp"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
-	"github.com/restic/restic/internal/backend"
 	"github.com/restic/restic/internal/backend/rest"
 	"github.com/restic/restic/internal/backend/test"
-	"github.com/restic/restic/internal/restic"
 	rtest "github.com/restic/restic/internal/test"
 )
 
-func runRESTServer(ctx context.Context, t testing.TB, dir string) (*url.URL, func()) {
+var (
+	serverStartedRE = regexp.MustCompile("^start server on (.*)$")
+)
+
+func runRESTServer(ctx context.Context, t testing.TB, dir, reqListenAddr string) (*url.URL, func()) {
 	srv, err := exec.LookPath("rest-server")
 	if err != nil {
 		t.Skip(err)
 	}
 
-	cmd := exec.CommandContext(ctx, srv, "--no-auth", "--path", dir)
+	// create our own context, so that our cleanup can cancel and wait for completion
+	// this will ensure any open ports, open unix sockets etc are properly closed
+	processCtx, cancel := context.WithCancel(ctx)
+	cmd := exec.CommandContext(processCtx, srv, "--no-auth", "--path", dir, "--listen", reqListenAddr)
+
+	// this cancel func is called by when the process context is done
+	cmd.Cancel = func() error {
+		// we execute in a Go-routine as we know the caller will
+		// be waiting on a .Wait() regardless
+		go func() {
+			// try to send a graceful termination signal
+			if cmd.Process.Signal(syscall.SIGTERM) == nil {
+				// if we succeed, then wait a few seconds
+				time.Sleep(2 * time.Second)
+			}
+			// and then make sure it's killed either way, ignoring any error code
+			_ = cmd.Process.Kill()
+		}()
+		return nil
+	}
+
+	// this is the cleanup function that we return the caller,
+	// which will cancel our process context, and then wait for it to finish
+	cleanup := func() {
+		cancel()
+		_ = cmd.Wait()
+	}
+
+	// but in-case we don't finish this method, e.g. by calling t.Fatal()
+	// we also defer a call to clean it up ourselves, guarded by a flag to
+	// indicate that we returned the function to the caller to deal with.
+	callerWillCleanUp := false
+	defer func() {
+		if !callerWillCleanUp {
+			cleanup()
+		}
+	}()
+
+	// send stdout to our std out
 	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stdout
+
+	// capture stderr with a pipe, as we want to examine this output
+	// to determine when the server is started and listening.
+	cmdErr, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// start the rest-server
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
 
-	// wait until the TCP port is reachable
-	var success bool
-	for i := 0; i < 10; i++ {
-		time.Sleep(200 * time.Millisecond)
+	// create a channel to receive the actual listen address on
+	listenAddrCh := make(chan string)
+	go func() {
+		defer close(listenAddrCh)
+		matched := false
+		br := bufio.NewReader(cmdErr)
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil {
+				// we ignore errors, as code that relies on this
+				// will happily fail via timeout and empty closed
+				// channel.
+				return
+			}
 
-		c, err := net.Dial("tcp", "localhost:8000")
-		if err != nil {
-			continue
+			line = strings.Trim(line, "\r\n")
+			if !matched {
+				// look for the server started message, and return the address
+				// that it's listening on
+				matchedServerListen := serverStartedRE.FindSubmatch([]byte(line))
+				if len(matchedServerListen) == 2 {
+					listenAddrCh <- string(matchedServerListen[1])
+					matched = true
+				}
+			}
+			t.Log(line)
 		}
+	}()
 
-		success = true
-		if err := c.Close(); err != nil {
-			t.Fatal(err)
+	// wait for us to get an address,
+	// or the parent context to cancel,
+	// or for us to timeout
+	var actualListenAddr string
+	select {
+	case <-processCtx.Done():
+		t.Fatal(context.Canceled)
+	case <-time.NewTimer(2 * time.Second).C:
+		t.Fatal(context.DeadlineExceeded)
+	case a, ok := <-listenAddrCh:
+		if !ok {
+			t.Fatal(context.Canceled)
 		}
+		actualListenAddr = a
 	}
 
-	if !success {
-		t.Fatal("unable to connect to rest server")
-		return nil, nil
+	// this translate the address that the server is listening on
+	// to a URL suitable for us to connect to
+	var addrToConnectTo string
+	if strings.HasPrefix(reqListenAddr, "unix:") {
+		addrToConnectTo = fmt.Sprintf("http+unix://%s:/restic-test/", actualListenAddr)
+	} else {
+		// while we may listen on 0.0.0.0, we connect to localhost
+		addrToConnectTo = fmt.Sprintf("http://%s/restic-test/", strings.Replace(actualListenAddr, "0.0.0.0", "localhost", 1))
 	}
 
-	url, err := url.Parse("http://localhost:8000/restic-test/")
+	// parse to a URL
+	url, err := url.Parse(addrToConnectTo)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	cleanup := func() {
-		if err := cmd.Process.Kill(); err != nil {
-			t.Fatal(err)
-		}
-
-		// ignore errors, we've killed the process
-		_ = cmd.Wait()
-	}
-
+	// indicate that we've completed successfully, and that the caller
+	// is responsible for calling cleanup
+	callerWillCleanUp = true
 	return url, cleanup
 }
 
-func newTestSuite(ctx context.Context, t testing.TB, url *url.URL, minimalData bool) *test.Suite {
-	tr, err := backend.Transport(backend.TransportOptions{})
-	if err != nil {
-		t.Fatalf("cannot create transport for tests: %v", err)
-	}
-
-	return &test.Suite{
+func newTestSuite(url *url.URL, minimalData bool) *test.Suite[rest.Config] {
+	return &test.Suite[rest.Config]{
 		MinimalData: minimalData,
 
 		// NewConfig returns a config for a new temporary backend that will be used in tests.
-		NewConfig: func() (interface{}, error) {
+		NewConfig: func() (*rest.Config, error) {
 			cfg := rest.NewConfig()
 			cfg.URL = url
-			return cfg, nil
+			return &cfg, nil
 		},
 
-		// CreateFn is a function that creates a temporary repository for the tests.
-		Create: func(config interface{}) (restic.Backend, error) {
-			cfg := config.(rest.Config)
-			return rest.Create(context.TODO(), cfg, tr)
-		},
-
-		// OpenFn is a function that opens a previously created temporary repository.
-		Open: func(config interface{}) (restic.Backend, error) {
-			cfg := config.(rest.Config)
-			return rest.Open(cfg, tr)
-		},
-
-		// CleanupFn removes data created during the tests.
-		Cleanup: func(config interface{}) error {
-			return nil
-		},
+		Factory: rest.NewFactory(),
 	}
 }
 
@@ -109,16 +170,13 @@ func TestBackendREST(t *testing.T) {
 		}
 	}()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
-	dir, cleanup := rtest.TempDir(t)
+	dir := rtest.TempDir(t)
+	serverURL, cleanup := runRESTServer(ctx, t, dir, ":0")
 	defer cleanup()
 
-	serverURL, cleanup := runRESTServer(ctx, t, dir)
-	defer cleanup()
-
-	newTestSuite(ctx, t, serverURL, false).RunTests(t)
+	newTestSuite(serverURL, false).RunTests(t)
 }
 
 func TestBackendRESTExternalServer(t *testing.T) {
@@ -132,23 +190,15 @@ func TestBackendRESTExternalServer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c := cfg.(rest.Config)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	newTestSuite(ctx, t, c.URL, true).RunTests(t)
+	newTestSuite(cfg.URL, true).RunTests(t)
 }
 
 func BenchmarkBackendREST(t *testing.B) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
-	dir, cleanup := rtest.TempDir(t)
+	dir := rtest.TempDir(t)
+	serverURL, cleanup := runRESTServer(ctx, t, dir, ":0")
 	defer cleanup()
 
-	serverURL, cleanup := runRESTServer(ctx, t, dir)
-	defer cleanup()
-
-	newTestSuite(ctx, t, serverURL, false).RunBenchmarks(t)
+	newTestSuite(serverURL, false).RunBenchmarks(t)
 }

@@ -12,20 +12,24 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	"github.com/restic/restic/internal/backend"
+	"github.com/restic/restic/internal/backend/limiter"
+	"github.com/restic/restic/internal/backend/location"
 	"github.com/restic/restic/internal/backend/rest"
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/errors"
-	"github.com/restic/restic/internal/limiter"
-	"golang.org/x/net/context/ctxhttp"
+	"github.com/restic/restic/internal/terminal"
 	"golang.org/x/net/http2"
 )
 
-// Backend is used to access data stored somewhere via rclone.
-type Backend struct {
+// rclone is used to access data stored somewhere via rclone.
+type rclone struct {
 	*rest.Backend
 	tr         *http2.Transport
 	cmd        *exec.Cmd
@@ -35,30 +39,35 @@ type Backend struct {
 	conn       *StdioConn
 }
 
+func NewFactory() location.Factory {
+	return location.NewLimitedBackendFactory("rclone", ParseConfig, location.NoPassword, Create, Open)
+}
+
 // run starts command with args and initializes the StdioConn.
-func run(command string, args ...string) (*StdioConn, *sync.WaitGroup, func() error, error) {
+func run(errorLog func(string, ...any), command string, args ...string) (*StdioConn, *sync.WaitGroup, chan struct{}, func() error, error) {
 	cmd := exec.Command(command, args...)
 
 	p, err := cmd.StderrPipe()
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 
 	var wg sync.WaitGroup
+	waitCh := make(chan struct{})
 
 	// start goroutine to add a prefix to all messages printed by to stderr by rclone
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
+		defer close(waitCh)
 		sc := bufio.NewScanner(p)
 		for sc.Scan() {
-			fmt.Fprintf(os.Stderr, "rclone: %v\n", sc.Text())
+			errorLog("rclone: %v\n", sc.Text())
 		}
-	}()
+		debug.Log("command has exited, closing waitCh")
+	})
 
 	r, stdin, err := os.Pipe()
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 
 	stdout, w, err := os.Pipe()
@@ -66,13 +75,13 @@ func run(command string, args ...string) (*StdioConn, *sync.WaitGroup, func() er
 		// close first pipe and ignore subsequent errors
 		_ = r.Close()
 		_ = stdin.Close()
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 
 	cmd.Stdin = r
 	cmd.Stdout = w
 
-	bg, err := backend.StartForeground(cmd)
+	bg, err := terminal.StartForeground(cmd)
 	// close rclone side of pipes
 	errR := r.Close()
 	errW := w.Close()
@@ -84,7 +93,10 @@ func run(command string, args ...string) (*StdioConn, *sync.WaitGroup, func() er
 		err = errW
 	}
 	if err != nil {
-		return nil, nil, nil, err
+		if errors.Is(err, exec.ErrDot) {
+			return nil, nil, nil, nil, errors.Errorf("cannot implicitly run relative executable %v found in current directory, use -o rclone.program=./<program> to override", cmd.Path)
+		}
+		return nil, nil, nil, nil, err
 	}
 
 	c := &StdioConn{
@@ -93,7 +105,7 @@ func run(command string, args ...string) (*StdioConn, *sync.WaitGroup, func() er
 		cmd:     cmd,
 	}
 
-	return c, &wg, bg, nil
+	return c, &wg, waitCh, bg, nil
 }
 
 // wrappedConn adds bandwidth limiting capabilities to the StdioConn by
@@ -127,7 +139,7 @@ func wrapConn(c *StdioConn, lim limiter.Limiter) *wrappedConn {
 }
 
 // New initializes a Backend and starts the process.
-func newBackend(cfg Config, lim limiter.Limiter) (*Backend, error) {
+func newBackend(ctx context.Context, cfg Config, lim limiter.Limiter, errorLog func(string, ...any)) (*rclone, error) {
 	var (
 		args []string
 		err  error
@@ -157,7 +169,7 @@ func newBackend(cfg Config, lim limiter.Limiter) (*Backend, error) {
 	arg0, args := args[0], args[1:]
 
 	debug.Log("running command: %v %v", arg0, args)
-	stdioConn, wg, bg, err := run(arg0, args...)
+	stdioConn, wg, waitCh, bg, err := run(errorLog, arg0, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -170,11 +182,11 @@ func newBackend(cfg Config, lim limiter.Limiter) (*Backend, error) {
 	dialCount := 0
 	tr := &http2.Transport{
 		AllowHTTP: true, // this is not really HTTP, just stdin/stdout
-		DialTLS: func(network, address string, cfg *tls.Config) (net.Conn, error) {
+		DialTLSContext: func(_ context.Context, network, address string, _ *tls.Config) (net.Conn, error) {
 			debug.Log("new connection requested, %v %v", network, address)
 			if dialCount > 0 {
 				// the connection to the child process is already closed
-				return nil, errors.New("rclone stdio connection already closed")
+				return nil, backoff.Permanent(errors.New("rclone stdio connection already closed"))
 			}
 			dialCount++
 			return conn, nil
@@ -182,8 +194,7 @@ func newBackend(cfg Config, lim limiter.Limiter) (*Backend, error) {
 	}
 
 	cmd := stdioConn.cmd
-	waitCh := make(chan struct{})
-	be := &Backend{
+	be := &rclone{
 		tr:     tr,
 		cmd:    cmd,
 		waitCh: waitCh,
@@ -191,36 +202,23 @@ func newBackend(cfg Config, lim limiter.Limiter) (*Backend, error) {
 		wg:     wg,
 	}
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		debug.Log("waiting for error result")
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	wg.Go(func() {
+		<-waitCh
+		cancel()
+
+		// according to the documentation of StdErrPipe, Wait() must only be called after the former has completed
 		err := cmd.Wait()
 		debug.Log("Wait returned %v", err)
 		be.waitResult = err
 		// close our side of the pipes to rclone, ignore errors
 		_ = stdioConn.CloseAll()
-		close(waitCh)
-	}()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		debug.Log("monitoring command to cancel first HTTP request context")
-		select {
-		case <-ctx.Done():
-			debug.Log("context has been cancelled, returning")
-		case <-be.waitCh:
-			debug.Log("command has exited, cancelling context")
-			cancel()
-		}
-	}()
+	})
 
 	// send an HTTP request to the base URL, see if the server is there
-	client := &http.Client{
+	client := http.Client{
 		Transport: debug.RoundTripper(tr),
 		Timeout:   cfg.Timeout,
 	}
@@ -235,14 +233,29 @@ func newBackend(cfg Config, lim limiter.Limiter) (*Backend, error) {
 	}
 	req.Header.Set("Accept", rest.ContentTypeV2)
 
-	res, err := ctxhttp.Do(ctx, client, req)
+	res, err := client.Do(req)
 	if err != nil {
 		// ignore subsequent errors
 		_ = bg()
 		_ = cmd.Process.Kill()
-		return nil, errors.Errorf("error talking HTTP to rclone: %v", err)
+
+		// wait for rclone to exit
+		wg.Wait()
+		// try to return the program exit code if communication with rclone has failed
+		if be.waitResult != nil &&
+			(errors.Is(err, context.Canceled) ||
+				errors.Is(err, io.ErrUnexpectedEOF) ||
+				errors.Is(err, syscall.EPIPE) ||
+				errors.Is(err, os.ErrClosed) ||
+				// there's unfortunately no better way to check for this error
+				strings.Contains(err.Error(), "http2: client conn could not be established")) {
+			err = be.waitResult
+		}
+
+		return nil, fmt.Errorf("error talking HTTP to rclone: %w", err)
 	}
 
+	_ = res.Body.Close()
 	debug.Log("HTTP status %q returned, moving instance to background", res.Status)
 	err = bg()
 	if err != nil {
@@ -253,8 +266,8 @@ func newBackend(cfg Config, lim limiter.Limiter) (*Backend, error) {
 }
 
 // Open starts an rclone process with the given config.
-func Open(cfg Config, lim limiter.Limiter) (*Backend, error) {
-	be, err := newBackend(cfg, lim)
+func Open(ctx context.Context, cfg Config, lim limiter.Limiter, errorLog func(string, ...any)) (backend.Backend, error) {
+	be, err := newBackend(ctx, cfg, lim, errorLog)
 	if err != nil {
 		return nil, err
 	}
@@ -269,7 +282,7 @@ func Open(cfg Config, lim limiter.Limiter) (*Backend, error) {
 		URL:         url,
 	}
 
-	restBackend, err := rest.Open(restConfig, debug.RoundTripper(be.tr))
+	restBackend, err := rest.Open(ctx, restConfig, debug.RoundTripper(be.tr), errorLog)
 	if err != nil {
 		_ = be.Close()
 		return nil, err
@@ -280,8 +293,8 @@ func Open(cfg Config, lim limiter.Limiter) (*Backend, error) {
 }
 
 // Create initializes a new restic repo with rclone.
-func Create(ctx context.Context, cfg Config) (*Backend, error) {
-	be, err := newBackend(cfg, nil)
+func Create(ctx context.Context, cfg Config, lim limiter.Limiter, errorLog func(string, ...any)) (backend.Backend, error) {
+	be, err := newBackend(ctx, cfg, lim, errorLog)
 	if err != nil {
 		return nil, err
 	}
@@ -298,7 +311,7 @@ func Create(ctx context.Context, cfg Config) (*Backend, error) {
 		URL:         url,
 	}
 
-	restBackend, err := rest.Create(ctx, restConfig, debug.RoundTripper(be.tr))
+	restBackend, err := rest.Create(ctx, restConfig, debug.RoundTripper(be.tr), errorLog)
 	if err != nil {
 		_ = be.Close()
 		return nil, err
@@ -311,7 +324,7 @@ func Create(ctx context.Context, cfg Config) (*Backend, error) {
 const waitForExit = 5 * time.Second
 
 // Close terminates the backend.
-func (be *Backend) Close() error {
+func (be *rclone) Close() error {
 	debug.Log("exiting rclone")
 	be.tr.CloseIdleConnections()
 
@@ -329,4 +342,10 @@ func (be *Backend) Close() error {
 	be.wg.Wait()
 	debug.Log("wait for rclone returned: %v", be.waitResult)
 	return be.waitResult
+}
+
+func (be *rclone) Properties() backend.Properties {
+	properties := be.Backend.Properties()
+	properties.HasFlakyErrors = true
+	return properties
 }

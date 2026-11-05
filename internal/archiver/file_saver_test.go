@@ -3,94 +3,83 @@ package archiver
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
 
-	"github.com/restic/chunker"
+	"github.com/restic/restic/internal/data"
 	"github.com/restic/restic/internal/fs"
-	"github.com/restic/restic/internal/restic"
+	"github.com/restic/restic/internal/repository"
 	"github.com/restic/restic/internal/test"
-	tomb "gopkg.in/tomb.v2"
+	"golang.org/x/sync/errgroup"
 )
 
-func createTestFiles(t testing.TB, num int) (files []string, cleanup func()) {
-	tempdir, cleanup := test.TempDir(t)
+func createTestFiles(t testing.TB, num int) (files []string) {
+	tempdir := test.TempDir(t)
 
-	for i := 0; i < 15; i++ {
+	for i := range num {
 		filename := fmt.Sprintf("testfile-%d", i)
-		err := ioutil.WriteFile(filepath.Join(tempdir, filename), []byte(filename), 0600)
+		err := os.WriteFile(filepath.Join(tempdir, filename), []byte(filename), 0600)
 		if err != nil {
 			t.Fatal(err)
 		}
 		files = append(files, filepath.Join(tempdir, filename))
 	}
 
-	return files, cleanup
+	return files
 }
 
-func startFileSaver(ctx context.Context, t testing.TB) (*FileSaver, context.Context, *tomb.Tomb) {
-	tmb, ctx := tomb.WithContext(ctx)
-
-	saveBlob := func(ctx context.Context, tpe restic.BlobType, buf *Buffer) FutureBlob {
-		ch := make(chan saveBlobResponse)
-		close(ch)
-		return FutureBlob{ch: ch}
-	}
+func startFileSaver(ctx context.Context, t testing.TB, _ fs.FS) (*fileSaver, *mockSaver, context.Context, *errgroup.Group) {
+	wg, ctx := errgroup.WithContext(ctx)
 
 	workers := uint(runtime.NumCPU())
-	pol, err := chunker.RandomPolynomial()
-	if err != nil {
-		t.Fatal(err)
+	chunkerFactory := repository.TestRepository(t).ChunkerFactory()
+
+	saver := &mockSaver{saved: make(map[string]int)}
+	s := newFileSaver(ctx, wg, saver, chunkerFactory, workers)
+	s.NodeFromFileInfo = func(snPath, filename string, meta toNoder, ignoreXattrListError bool) (*data.Node, error) {
+		return meta.ToNode(ignoreXattrListError, t.Logf)
 	}
 
-	s := NewFileSaver(ctx, tmb, saveBlob, pol, workers, workers)
-	s.NodeFromFileInfo = restic.NodeFromFileInfo
-
-	return s, ctx, tmb
+	return s, saver, ctx, wg
 }
 
 func TestFileSaver(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	files, cleanup := createTestFiles(t, 15)
-	defer cleanup()
+	ctx := t.Context()
 
 	startFn := func() {}
-	completeFn := func(*restic.Node, ItemStats) {}
+	completeReadingFn := func() {}
+	completeFn := func(*data.Node, ItemStats) {}
 
-	testFs := fs.Local{}
-	s, ctx, tmb := startFileSaver(ctx, t)
+	files := createTestFiles(t, 15)
+	testFs := fs.NewLocal()
+	s, saver, ctx, wg := startFileSaver(ctx, t, testFs)
 
-	var results []FutureFile
+	var results []futureNode
 
 	for _, filename := range files {
-		f, err := testFs.Open(filename)
+		f, err := testFs.OpenFile(filename, os.O_RDONLY, false)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		fi, err := f.Stat()
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		ff := s.Save(ctx, filename, f, fi, startFn, completeFn)
+		ff := s.Save(ctx, filename, filename, f, startFn, completeReadingFn, completeFn)
 		results = append(results, ff)
 	}
 
 	for _, file := range results {
-		file.Wait(ctx)
-		if file.Err() != nil {
-			t.Errorf("unable to save file: %v", file.Err())
+		fnr := file.take(ctx)
+		if fnr.err != nil {
+			t.Errorf("unable to save file: %v", fnr.err)
 		}
 	}
 
-	tmb.Kill(nil)
+	test.Assert(t, len(saver.saved) == len(files), "expected %d saved files, got %d", len(files), len(saver.saved))
 
-	err := tmb.Wait()
+	s.TriggerShutdown()
+
+	err := wg.Wait()
 	if err != nil {
 		t.Fatal(err)
 	}
